@@ -4,22 +4,60 @@ import { useState, useRef, useEffect, useCallback } from "react";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type PermissionState = "idle" | "requesting" | "granted" | "denied" | "error";
+type PermissionState = "idle" | "requesting" | "granted" | "denied" | "error" | "unsupported";
 type AppState = "permissions" | "ready" | "listening" | "thinking" | "speaking";
-
 interface Message {
   role: "user" | "assistant";
   content: string;
 }
 
+// ─── Platform detection ───────────────────────────────────────────────────────
+// iOS Safari/Chrome/Firefox all use WebKit under the hood and share its quirks
+// (no SpeechRecognition on iOS Chrome/Firefox, strict audio-gesture rules).
+
+function isIOS() {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent;
+  const iOSDevice = /iPad|iPhone|iPod/.test(ua);
+  // iPadOS 13+ reports as "Mac" with touch support — detect that case too.
+  const iPadOS13Up = navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
+  return iOSDevice || iPadOS13Up;
+}
+
 // ─── TTS Hook ─────────────────────────────────────────────────────────────────
+// iOS Safari/Chrome require every audio.play() call to be triggered by, or
+// directly inside the call stack of, a user gesture the FIRST time — after
+// one successful unlocked play() the element can usually be reused freely.
 
 function useTTS() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const unlockedRef = useRef(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
 
+  // Call this synchronously inside a click/touchend handler to "unlock" audio
+  // playback on iOS before any async work happens. Plays a near-silent blip.
+  const unlock = useCallback(() => {
+    if (unlockedRef.current) return;
+    try {
+      const a = new Audio();
+      // Tiny silent WAV — valid audio, effectively inaudible, very short.
+      a.src =
+        "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+      a.volume = 0;
+      const p = a.play();
+      if (p && typeof p.then === "function") {
+        p.then(() => { unlockedRef.current = true; }).catch(() => { /* will retry unlock next gesture */ });
+      } else {
+        unlockedRef.current = true;
+      }
+    } catch {
+      // Ignore — speak() will still try and may simply fail silently on first attempt.
+    }
+  }, []);
+
   const speak = useCallback(async (text: string) => {
+    if (!text || !text.trim()) return;
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current.src = "";
@@ -40,13 +78,19 @@ function useTTS() {
       const url = URL.createObjectURL(blob);
       const audio = new Audio();
       audio.preload = "auto";
+      // playsInline-equivalent for <audio> isn't needed, but setting these
+      // helps some in-app/Android WebViews route playback correctly.
+      audio.setAttribute("playsinline", "true");
       audioRef.current = audio;
       audio.onplay = () => { setIsLoading(false); setIsSpeaking(true); };
       audio.onended = () => { setIsSpeaking(false); audioRef.current = null; setTimeout(() => URL.revokeObjectURL(url), 1000); };
       audio.onerror = () => { setIsSpeaking(false); setIsLoading(false); audioRef.current = null; URL.revokeObjectURL(url); };
       audio.src = url;
       await audio.play();
+      unlockedRef.current = true;
     } catch (err) {
+      // Most common mobile failure mode: NotAllowedError because this call
+      // wasn't inside a user gesture (e.g. it was fired from a setTimeout).
       console.error("[TTS]", err);
       setIsSpeaking(false);
       setIsLoading(false);
@@ -60,47 +104,85 @@ function useTTS() {
   }, []);
 
   useEffect(() => () => { audioRef.current?.pause(); }, []);
-  return { speak, stop, isSpeaking, isLoading };
+  return { speak, stop, unlock, isSpeaking, isLoading };
 }
 
 // ─── STT Hook ─────────────────────────────────────────────────────────────────
+// SpeechRecognition is unavailable on iOS Chrome/Firefox and any Firefox
+// without the flag enabled. We feature-detect once and expose `supported`
+// so the UI can offer a typed-text fallback instead of a dead button.
 
 type AnyRecognition = {
   continuous: boolean; interimResults: boolean; lang: string;
   onstart: (() => void) | null; onend: (() => void) | null;
   onerror: ((e: { error: string }) => void) | null;
   onresult: ((e: { results: { [k: number]: { [k: number]: { transcript: string } } } }) => void) | null;
-  start: () => void; stop: () => void;
+  start: () => void; stop: () => void; abort: () => void;
 };
+
+function getSpeechRecognitionCtor(): (new () => AnyRecognition) | null {
+  if (typeof window === "undefined") return null;
+  const w = window as unknown as Record<string, new () => AnyRecognition>;
+  return w["SpeechRecognition"] || w["webkitSpeechRecognition"] || null;
+}
 
 function useSTT(onResult: (text: string) => void) {
   const recognitionRef = useRef<AnyRecognition | null>(null);
   const [isListening, setIsListening] = useState(false);
+  const [supported, setSupported] = useState(true);
+
+  useEffect(() => {
+    setSupported(getSpeechRecognitionCtor() !== null);
+  }, []);
 
   const start = useCallback(() => {
-    const w = window as unknown as Record<string, new () => AnyRecognition>;
-    const SR = w["SpeechRecognition"] || w["webkitSpeechRecognition"];
-    if (!SR) return;
-    if (recognitionRef.current) { recognitionRef.current.stop(); recognitionRef.current = null; }
+    const SR = getSpeechRecognitionCtor();
+    if (!SR) {
+      setSupported(false);
+      return;
+    }
+    if (recognitionRef.current) {
+      try { recognitionRef.current.stop(); } catch { /* noop */ }
+      recognitionRef.current = null;
+    }
     const rec = new SR();
-    rec.continuous = false; rec.interimResults = false; rec.lang = "en-US";
+    rec.continuous = false;
+    rec.interimResults = false;
+    rec.lang = "en-US";
     rec.onstart = () => setIsListening(true);
     rec.onend = () => setIsListening(false);
-    rec.onerror = () => setIsListening(false);
+    rec.onerror = (e) => {
+      console.error("[STT] error:", e.error);
+      setIsListening(false);
+    };
     rec.onresult = (e) => {
       const t = e.results[0]?.[0]?.transcript ?? "";
       if (t.trim()) onResult(t.trim());
     };
     recognitionRef.current = rec;
-    rec.start();
+    try {
+      rec.start();
+    } catch (err) {
+      console.error("[STT] start failed:", err);
+      setIsListening(false);
+    }
   }, [onResult]);
 
-  const stop = useCallback(() => { recognitionRef.current?.stop(); setIsListening(false); }, []);
-  useEffect(() => () => { recognitionRef.current?.stop(); }, []);
-  return { start, stop, isListening };
+  const stop = useCallback(() => {
+    try { recognitionRef.current?.stop(); } catch { /* noop */ }
+    setIsListening(false);
+  }, []);
+
+  useEffect(() => () => {
+    try { recognitionRef.current?.abort(); } catch { /* noop */ }
+  }, []);
+
+  return { start, stop, isListening, supported };
 }
 
 // ─── Audio Visualizer Canvas ─────────────────────────────────────────────────
+// Uses devicePixelRatio-aware sizing so it renders crisply on high-DPI phone
+// screens instead of the fixed 500x500 buffer being stretched/blurred by CSS.
 
 function AudioVisualizer({ appState }: { appState: AppState }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -113,15 +195,22 @@ function AudioVisualizer({ appState }: { appState: AppState }) {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext("2d")!;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const safeCtx = ctx; // capture for closure — TypeScript loses narrowing in nested fns
 
-    // Init bars
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const cssSize = canvas.clientWidth || 500;
+    canvas.width = cssSize * dpr;
+    canvas.height = cssSize * dpr;
+    safeCtx.scale(dpr, dpr);
+
     if (barsRef.current.length === 0) {
       barsRef.current = Array.from({ length: BAR_COUNT }, () => 0);
     }
 
-    const W = canvas.width;
-    const H = canvas.height;
+    const W = cssSize;
+    const H = cssSize;
     const cx = W / 2;
     const cy = H / 2;
     const radius = Math.min(W, H) * 0.28;
@@ -129,32 +218,25 @@ function AudioVisualizer({ appState }: { appState: AppState }) {
     const isActive = appState === "speaking" || appState === "listening";
     const isThinking = appState === "thinking";
 
-    function easeOut(t: number) { return 1 - Math.pow(1 - t, 3); }
-
     function draw() {
       timeRef.current += 0.03;
       const t = timeRef.current;
 
-      ctx.clearRect(0, 0, W, H);
+      safeCtx.clearRect(0, 0, W, H);
 
-      // Update bars with simulated audio-reactive movement
       barsRef.current = barsRef.current.map((v, i) => {
         if (!isActive && !isThinking) {
-          // Idle: gentle ambient breathing
           const target = 0.04 + 0.06 * Math.sin(t * 0.8 + i * 0.3);
           return v + (target - v) * 0.08;
         }
         if (isThinking) {
-          // Thinking: slow orbital wave
           const target = 0.15 + 0.15 * Math.sin(t * 1.2 + i * (Math.PI * 2 / BAR_COUNT) * 3);
           return v + (target - v) * 0.06;
         }
-        // Active speaking/listening: bass-heavy disco effect
         const bass = i < 8 || i > BAR_COUNT - 9;
         const mid = (i >= 8 && i <= 20) || (i >= BAR_COUNT - 21 && i <= BAR_COUNT - 9);
         let target: number;
         if (bass) {
-          // Big bass bars
           target = 0.3 + 0.55 * Math.abs(Math.sin(t * (appState === "speaking" ? 3.2 : 2.4) + i * 0.5))
             + 0.15 * Math.abs(Math.sin(t * 1.7 + i * 0.9));
         } else if (mid) {
@@ -164,12 +246,10 @@ function AudioVisualizer({ appState }: { appState: AppState }) {
           target = 0.05 + 0.25 * Math.abs(Math.sin(t * 1.5 + i * 0.6))
             + 0.05 * Math.abs(Math.sin(t * 4.1 + i));
         }
-        // Add random spike for disco feel
         if (Math.random() < 0.015 && bass) target = Math.min(target + 0.3, 1.0);
         return v + (target - v) * 0.18;
       });
 
-      // ── Draw arc reactor bars radially ──
       for (let i = 0; i < BAR_COUNT; i++) {
         const angle = (i / BAR_COUNT) * Math.PI * 2 - Math.PI / 2;
         const barH = barsRef.current[i];
@@ -182,7 +262,6 @@ function AudioVisualizer({ appState }: { appState: AppState }) {
         const x2 = cx + Math.cos(angle) * outerR;
         const y2 = cy + Math.sin(angle) * outerR;
 
-        // Color based on state + bar intensity
         let r: number, g: number, b: number;
         if (appState === "listening") {
           r = 220 + Math.floor(barH * 35);
@@ -193,7 +272,6 @@ function AudioVisualizer({ appState }: { appState: AppState }) {
           g = 100 + Math.floor(barH * 50);
           b = 240;
         } else {
-          // speaking or idle: cyan/electric blue
           r = Math.floor(barH * 80);
           g = 180 + Math.floor(barH * 75);
           b = 255;
@@ -201,35 +279,31 @@ function AudioVisualizer({ appState }: { appState: AppState }) {
 
         const alpha = 0.3 + barH * 0.7;
 
-        // Glow effect: draw thick blurred bar then sharp bar on top
-        ctx.save();
-        ctx.strokeStyle = `rgba(${r},${g},${b},${alpha * 0.35})`;
-        ctx.lineWidth = 4;
-        ctx.lineCap = "round";
-        ctx.shadowColor = `rgba(${r},${g},${b},0.9)`;
-        ctx.shadowBlur = isActive ? 12 + barH * 18 : 4;
-        ctx.beginPath();
-        ctx.moveTo(x1, y1);
-        ctx.lineTo(x2, y2);
-        ctx.stroke();
+        safeCtx.save();
+        safeCtx.strokeStyle = `rgba(${r},${g},${b},${alpha * 0.35})`;
+        safeCtx.lineWidth = 4;
+        safeCtx.lineCap = "round";
+        safeCtx.shadowColor = `rgba(${r},${g},${b},0.9)`;
+        safeCtx.shadowBlur = isActive ? 12 + barH * 18 : 4;
+        safeCtx.beginPath();
+        safeCtx.moveTo(x1, y1);
+        safeCtx.lineTo(x2, y2);
+        safeCtx.stroke();
 
-        // Sharp bright core of bar
-        ctx.strokeStyle = `rgba(${r},${g},${b},${alpha})`;
-        ctx.lineWidth = isActive && barH > 0.6 ? 2.5 : 1.5;
-        ctx.shadowBlur = 0;
-        ctx.beginPath();
-        ctx.moveTo(x1, y1);
-        ctx.lineTo(x2, y2);
-        ctx.stroke();
-        ctx.restore();
+        safeCtx.strokeStyle = `rgba(${r},${g},${b},${alpha})`;
+        safeCtx.lineWidth = isActive && barH > 0.6 ? 2.5 : 1.5;
+        safeCtx.shadowBlur = 0;
+        safeCtx.beginPath();
+        safeCtx.moveTo(x1, y1);
+        safeCtx.lineTo(x2, y2);
+        safeCtx.stroke();
+        safeCtx.restore();
       }
 
-      // ── Arc reactor core glow ──
       const pulseScale = isActive ? 1 + 0.06 * Math.sin(t * 4) : 1 + 0.02 * Math.sin(t * 1.5);
       const coreR = radius * pulseScale;
 
-      // Outer ambient glow
-      const outerGlow = ctx.createRadialGradient(cx, cy, coreR * 0.3, cx, cy, coreR * 1.4);
+      const outerGlow = safeCtx.createRadialGradient(cx, cy, coreR * 0.3, cx, cy, coreR * 1.4);
       if (appState === "listening") {
         outerGlow.addColorStop(0, `rgba(220,60,60,${0.12 + barAmplitude(barsRef.current) * 0.15})`);
         outerGlow.addColorStop(1, "rgba(0,0,0,0)");
@@ -240,10 +314,10 @@ function AudioVisualizer({ appState }: { appState: AppState }) {
         outerGlow.addColorStop(0, `rgba(0,180,255,${0.08 + barAmplitude(barsRef.current) * 0.12})`);
         outerGlow.addColorStop(1, "rgba(0,0,0,0)");
       }
-      ctx.beginPath();
-      ctx.arc(cx, cy, coreR * 1.4, 0, Math.PI * 2);
-      ctx.fillStyle = outerGlow;
-      ctx.fill();
+      safeCtx.beginPath();
+      safeCtx.arc(cx, cy, coreR * 1.4, 0, Math.PI * 2);
+      safeCtx.fillStyle = outerGlow;
+      safeCtx.fill();
 
       animRef.current = requestAnimationFrame(draw);
     }
@@ -255,8 +329,6 @@ function AudioVisualizer({ appState }: { appState: AppState }) {
   return (
     <canvas
       ref={canvasRef}
-      width={500}
-      height={500}
       className="absolute inset-0 w-full h-full"
       style={{ pointerEvents: "none" }}
     />
@@ -276,9 +348,8 @@ function ArcReactorRings({ appState }: { appState: AppState }) {
 
   return (
     <>
-      {/* Outermost ring — slow spin */}
       <div className="absolute rounded-full" style={{
-        width: 340, height: 340,
+        width: "68%", height: "68%",
         border: `1px solid rgba(${color},${alpha})`,
         animationName: "jSpin",
         animationDuration: "22s",
@@ -292,15 +363,14 @@ function ArcReactorRings({ appState }: { appState: AppState }) {
             height: i % 8 === 0 ? 10 : 5,
             background: i % 8 === 0 ? `rgba(${color},0.6)` : `rgba(${color},0.2)`,
             top: "50%", left: "50%",
-            transformOrigin: `1px -168px`,
-            transform: `rotate(${i * (360 / 32)}deg) translateY(-168px)`,
+            transformOrigin: `1px 84px`,
+            transform: `rotate(${i * (360 / 32)}deg) translateY(-84px)`,
           }} />
         ))}
       </div>
 
-      {/* Middle ring — counter-spin */}
       <div className="absolute rounded-full" style={{
-        width: 300, height: 300,
+        width: "60%", height: "60%",
         border: `1px solid rgba(${color},${alpha * 0.6})`,
         animationName: "jSpin",
         animationDuration: "16s",
@@ -313,15 +383,14 @@ function ArcReactorRings({ appState }: { appState: AppState }) {
             width: 3, height: 3,
             background: `rgba(${color},0.4)`,
             top: "50%", left: "50%",
-            transformOrigin: "1.5px -148px",
-            transform: `rotate(${i * (360 / 16)}deg) translateY(-148px)`,
+            transformOrigin: "1.5px 74px",
+            transform: `rotate(${i * (360 / 16)}deg) translateY(-74px)`,
           }} />
         ))}
       </div>
 
-      {/* Inner ring — fast spin */}
       <div className="absolute rounded-full" style={{
-        width: 260, height: 260,
+        width: "52%", height: "52%",
         border: `1px solid rgba(${color},${alpha * 0.4})`,
         animationName: "jSpin",
         animationDuration: "9s",
@@ -334,15 +403,14 @@ function ArcReactorRings({ appState }: { appState: AppState }) {
             width: 1, height: 14,
             background: `rgba(${color},0.5)`,
             top: "50%", left: "50%",
-            transformOrigin: "0.5px -128px",
-            transform: `rotate(${i * 60}deg) translateY(-128px)`,
+            transformOrigin: "0.5px 64px",
+            transform: `rotate(${i * 60}deg) translateY(-64px)`,
           }} />
         ))}
       </div>
 
-      {/* Innermost accent ring */}
       <div className="absolute rounded-full" style={{
-        width: 220, height: 220,
+        width: "44%", height: "44%",
         border: `1px solid rgba(${color},0.06)`,
         boxShadow: `0 0 ${appState === "speaking" ? 30 : 10}px rgba(${color},0.1)`,
       }} />
@@ -356,6 +424,8 @@ export default function JarvisPage() {
   const [appState, setAppState] = useState<AppState>("permissions");
   const [jarvisText, setJarvisText] = useState("Systems online. How can I assist you today, sir?");
   const [messages, setMessages] = useState<Message[]>([]);
+  const [textFallbackOpen, setTextFallbackOpen] = useState(false);
+  const [textInput, setTextInput] = useState("");
 
   const [locStatus, setLocStatus] = useState<PermissionState>("idle");
   const [micStatus, setMicStatus] = useState<PermissionState>("idle");
@@ -371,6 +441,9 @@ export default function JarvisPage() {
   const locRef = useRef<PermissionState>("idle");
   const micRef = useRef<PermissionState>("idle");
   const camRef = useRef<PermissionState>("idle");
+  // Guards against the synthetic click that fires right after touchend on
+  // mobile browsers, which would otherwise call the orb handler twice.
+  const lastPointerActionRef = useRef(0);
 
   useEffect(() => { messagesRef.current = messages; }, [messages]);
   useEffect(() => { coordsRef.current = coords; }, [coords]);
@@ -379,8 +452,12 @@ export default function JarvisPage() {
   useEffect(() => { micRef.current = micStatus; }, [micStatus]);
   useEffect(() => { camRef.current = camStatus; }, [camStatus]);
 
-  const { speak, stop: stopTTS, isSpeaking, isLoading: ttsLoading } = useTTS();
-  const allGranted = locStatus === "granted" && micStatus === "granted" && camStatus === "granted";
+  const { speak, stop: stopTTS, unlock: unlockAudio, isSpeaking, isLoading: ttsLoading } = useTTS();
+
+  // Camera is optional/cosmetic for this build — only mic + location are
+  // required to operate the assistant. Gating on camera meant any user who
+  // denies it (or whose device doesn't expose one) got stuck forever.
+  const allGranted = locStatus === "granted" && micStatus === "granted";
 
   const handleVoiceInput = useCallback(async (text: string) => {
     if (!text.trim()) return;
@@ -427,7 +504,7 @@ export default function JarvisPage() {
     }
   }, [speak, stopTTS]);
 
-  const { start: startSTT, stop: stopSTT, isListening } = useSTT(handleVoiceInput);
+  const { start: startSTT, stop: stopSTT, isListening, supported: sttSupported } = useSTT(handleVoiceInput);
 
   useEffect(() => {
     if (appState === "thinking") return;
@@ -439,11 +516,20 @@ export default function JarvisPage() {
   useEffect(() => {
     if (allGranted && appState === "permissions") {
       setAppState("ready");
+      // NOTE: this won't reliably play on iOS because it's not inside the
+      // gesture call stack — the unlock() call fired synchronously inside
+      // the INITIALIZE button press (see requestAll) handles that instead.
+      // We still attempt it for desktop browsers where it works fine.
       setTimeout(() => speak(jarvisText), 800);
     }
   }, [allGranted]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const requestAll = useCallback(async () => {
+    // Unlock audio synchronously, inside this user-gesture handler, before
+    // any awaited/async permission prompts run. This is the one moment on
+    // iOS we're guaranteed a real user gesture is on the call stack.
+    unlockAudio();
+
     if ("geolocation" in navigator) {
       setLocStatus("requesting");
       navigator.geolocation.getCurrentPosition(
@@ -458,111 +544,160 @@ export default function JarvisPage() {
         () => setLocStatus("denied"),
         { enableHighAccuracy: false, timeout: 10_000, maximumAge: 60_000 }
       );
-    } else { setLocStatus("error"); }
+    } else {
+      setLocStatus("error");
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setMicStatus("unsupported");
+      setCamStatus("unsupported");
+      return;
+    }
 
     setMicStatus("requesting");
-    setCamStatus("requesting");
-    try {
-      const s = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-      s.getTracks().forEach((t) => t.stop());
-      setMicStatus("granted"); setCamStatus("granted"); return;
-    } catch { /* try individually */ }
     try {
       const a = await navigator.mediaDevices.getUserMedia({ audio: true });
-      a.getTracks().forEach((t) => t.stop()); setMicStatus("granted");
-    } catch { setMicStatus("denied"); }
+      a.getTracks().forEach((t) => t.stop());
+      setMicStatus("granted");
+    } catch {
+      setMicStatus("denied");
+    }
+
+    // Camera is requested separately and never blocks the app from
+    // becoming usable — some users don't have one, and on Android Chrome a
+    // combined audio+video prompt that's partially denied can leave both
+    // permissions stuck in a confusing state.
+    setCamStatus("requesting");
     try {
       const v = await navigator.mediaDevices.getUserMedia({ video: true });
-      v.getTracks().forEach((t) => t.stop()); setCamStatus("granted");
-    } catch { setCamStatus("denied"); }
-  }, []);
+      v.getTracks().forEach((t) => t.stop());
+      setCamStatus("granted");
+    } catch {
+      setCamStatus("denied");
+    }
+  }, [unlockAudio]);
 
-  const handleOrbClick = useCallback(() => {
+  // Single source of truth for "activate the orb" so click (desktop mouse),
+  // touch (iOS/Android browsers), and pointer events never double-fire or
+  // disagree about the current state.
+  const activateOrb = useCallback(() => {
     if (!allGranted) return;
     if (appState === "listening") { stopSTT(); return; }
     if (appState === "speaking") { stopTTS(); return; }
     if (appState === "thinking") { abortRef.current?.abort(); setAppState("ready"); return; }
-    if (appState === "ready") { startSTT(); }
-  }, [appState, allGranted, startSTT, stopSTT, stopTTS]);
+    if (appState === "ready") {
+      if (!sttSupported) { setTextFallbackOpen(true); return; }
+      startSTT();
+    }
+  }, [appState, allGranted, sttSupported, startSTT, stopSTT, stopTTS]);
+
+  const handlePointerUp = useCallback((e: React.PointerEvent) => {
+    e.preventDefault();
+    lastPointerActionRef.current = Date.now();
+    activateOrb();
+  }, [activateOrb]);
+
+  const handleClick = useCallback(() => {
+    // Suppress the synthetic click mobile browsers fire ~after pointerup;
+    // only handle real mouse clicks here (no recent pointer activation).
+    if (Date.now() - lastPointerActionRef.current < 700) return;
+    activateOrb();
+  }, [activateOrb]);
+
+  const submitTextFallback = useCallback(() => {
+    const t = textInput.trim();
+    if (!t) return;
+    setTextInput("");
+    setTextFallbackOpen(false);
+    handleVoiceInput(t);
+  }, [textInput, handleVoiceInput]);
 
   if (appState === "permissions") {
     return <PermissionsScreen locStatus={locStatus} micStatus={micStatus} camStatus={camStatus} onRequest={requestAll} />;
   }
 
-  // State-driven colors
   const stateColor =
     appState === "listening" ? "220,60,60" :
-    appState === "thinking"  ? "140,100,255" :
-    appState === "speaking"  ? "0,212,255" : "0,180,220";
+    appState === "thinking" ? "140,100,255" :
+    appState === "speaking" ? "0,212,255" : "0,180,220";
 
   const isActive = appState === "speaking" || appState === "listening";
 
   return (
-    <div className="min-h-screen bg-[#020609] flex flex-col items-center justify-center font-mono overflow-hidden relative select-none">
-
-      {/* Deep space background */}
+    <div
+      className="min-h-[100dvh] bg-[#020609] flex flex-col items-center justify-center font-mono overflow-hidden relative select-none"
+      style={{ touchAction: "manipulation" }}
+    >
       <div className="absolute inset-0" style={{
         background: `radial-gradient(ellipse at 50% 50%, rgba(${stateColor},0.04) 0%, #020609 55%, #010305 100%)`,
         transition: "background 1s ease",
       }} />
 
-      {/* HUD grid */}
       <div className="absolute inset-0 opacity-[0.025]" style={{
         backgroundImage: "linear-gradient(#00d4ff 1px,transparent 1px),linear-gradient(90deg,#00d4ff 1px,transparent 1px)",
         backgroundSize: "80px 80px",
       }} />
 
-      {/* Scanlines */}
       <div className="absolute inset-0 pointer-events-none" style={{
         backgroundImage: "repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,0.05) 3px,rgba(0,0,0,0.05) 4px)",
       }} />
 
-      {/* Corner HUD brackets */}
       <HudCorners color={stateColor} />
 
-      {/* Top header — JARVIS wordmark only, no other text */}
-      <div className="absolute top-6 left-0 right-0 flex flex-col items-center gap-1 z-10">
-        <div className="flex items-center gap-4">
-          <div className="h-px w-20" style={{ background: `linear-gradient(to right, transparent, rgba(${stateColor},0.4))` }} />
-          <span className="text-[11px] tracking-[0.6em]" style={{ color: `rgba(${stateColor},0.55)` }}>J · A · R · V · I · S</span>
-          <div className="h-px w-20" style={{ background: `linear-gradient(to left, transparent, rgba(${stateColor},0.4))` }} />
+      <div className="absolute top-[max(1.5rem,env(safe-area-inset-top))] left-0 right-0 flex flex-col items-center gap-1 z-10 px-4">
+        <div className="flex items-center gap-3 sm:gap-4">
+          <div className="h-px w-12 sm:w-20" style={{ background: `linear-gradient(to right, transparent, rgba(${stateColor},0.4))` }} />
+          <span className="text-[9px] sm:text-[11px] tracking-[0.5em] sm:tracking-[0.6em] whitespace-nowrap" style={{ color: `rgba(${stateColor},0.55)` }}>J · A · R · V · I · S</span>
+          <div className="h-px w-12 sm:w-20" style={{ background: `linear-gradient(to left, transparent, rgba(${stateColor},0.4))` }} />
         </div>
-        <span className="text-[7px] tracking-[0.35em]" style={{ color: `rgba(${stateColor},0.2)` }}>STARK INDUSTRIES · AUTONOMOUS INTELLIGENCE</span>
+        <span className="text-[6px] sm:text-[7px] tracking-[0.3em] sm:tracking-[0.35em] text-center" style={{ color: `rgba(${stateColor},0.2)` }}>STARK INDUSTRIES · AUTONOMOUS INTELLIGENCE</span>
       </div>
 
-      {/* State indicator dot — top center */}
-      <div className="absolute z-10" style={{ top: 80 }}>
+      <div className="absolute z-10" style={{ top: "max(5.5rem, calc(env(safe-area-inset-top) + 4.5rem))" }}>
         <StateDot state={appState} color={stateColor} />
       </div>
 
-      {/* Weather — top right, icon only */}
       {weather && (
-        <div className="absolute top-6 right-6 z-10 flex flex-col items-end gap-0.5">
+        <div className="absolute z-10 flex flex-col items-end gap-0.5" style={{ top: "max(1.5rem, env(safe-area-inset-top))", right: "max(1rem, env(safe-area-inset-right))" }}>
           <span className="text-[11px] font-light" style={{ color: `rgba(${stateColor},0.5)` }}>
             {weather.temperature}{weather.units.temperature}
           </span>
           <div className="flex gap-[2px]">
-            {[3,5,4,6,3].map((h,i) => (
+            {[3, 5, 4, 6, 3].map((h, i) => (
               <div key={i} style={{ width: 2, height: h, background: `rgba(${stateColor},0.25)`, borderRadius: 1 }} />
             ))}
           </div>
         </div>
       )}
 
-      {/* ── MAIN ORB AREA ── */}
-      <div className="relative z-10 flex items-center justify-center" style={{ width: 500, height: 500 }}>
+      {!sttSupported && (
+        <div className="absolute z-10 px-3 py-1 rounded-sm text-[7px] tracking-[0.2em]" style={{
+          top: "max(8.5rem, calc(env(safe-area-inset-top) + 7.5rem))",
+          border: `1px solid rgba(${stateColor},0.2)`,
+          color: `rgba(${stateColor},0.5)`,
+          background: "rgba(3,10,16,0.7)",
+        }}>
+          VOICE INPUT UNAVAILABLE · TAP TO TYPE
+        </div>
+      )}
 
-        {/* Canvas audio visualizer — behind orb */}
+      {/* MAIN ORB AREA — fluid, viewport-aware sizing instead of a fixed 500px box */}
+      <div
+        className="relative z-10 flex items-center justify-center"
+        style={{
+          width: "min(85vw, 420px)",
+          height: "min(85vw, 420px)",
+          maxWidth: "min(85vh, 420px)",
+          maxHeight: "min(85vh, 420px)",
+        }}
+      >
         <AudioVisualizer appState={appState} />
-
-        {/* Arc reactor rings */}
         <ArcReactorRings appState={appState} />
 
-        {/* Outer ping rings for active states */}
         {isActive && (
           <>
             <div className="absolute rounded-full" style={{
-              width: 380, height: 380,
+              width: "76%", height: "76%",
               border: `1px solid rgba(${stateColor},0.15)`,
               animationName: "jPing",
               animationDuration: "2.2s",
@@ -570,7 +705,7 @@ export default function JarvisPage() {
               animationIterationCount: "infinite",
             }} />
             <div className="absolute rounded-full" style={{
-              width: 380, height: 380,
+              width: "76%", height: "76%",
               border: `1px solid rgba(${stateColor},0.1)`,
               animationName: "jPing",
               animationDuration: "2.2s",
@@ -581,13 +716,25 @@ export default function JarvisPage() {
           </>
         )}
 
-        {/* Main orb button */}
         <button
-          onClick={handleOrbClick}
+          type="button"
+          onPointerUp={handlePointerUp}
+          onClick={handleClick}
           disabled={appState === "thinking"}
-          className="absolute rounded-full focus:outline-none transition-all duration-700"
+          aria-label={
+            appState === "listening" ? "Stop listening" :
+            appState === "speaking" ? "Stop speaking" :
+            appState === "thinking" ? "Processing" : "Start voice input"
+          }
+          className="absolute rounded-full focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 transition-all duration-700"
           style={{
-            width: 180, height: 180,
+            width: "36%",
+            height: "36%",
+            minWidth: 120,
+            minHeight: 120,
+            outlineColor: `rgba(${stateColor},0.6)`,
+            WebkitTapHighlightColor: "transparent",
+            touchAction: "manipulation",
             background:
               appState === "listening"
                 ? "radial-gradient(circle at 38% 35%, rgba(255,100,100,0.28) 0%, rgba(160,30,30,0.18) 45%, rgba(25,4,4,0.94) 100%)"
@@ -605,22 +752,29 @@ export default function JarvisPage() {
             cursor: appState === "thinking" ? "not-allowed" : "pointer",
           }}
         >
-          {/* Glass specular */}
           <div className="absolute rounded-full pointer-events-none" style={{
-            width: 58, height: 32, top: 28, left: 34,
+            width: "32%", height: "18%", top: "16%", left: "19%",
             background: "radial-gradient(ellipse, rgba(255,255,255,0.09) 0%, transparent 100%)",
             transform: "rotate(-22deg)",
           }} />
 
-          {/* Center icon */}
           <OrbCenter appState={appState} color={stateColor} />
         </button>
       </div>
 
-      {/* Bottom action indicator — icon only, no text */}
-      <div className="absolute bottom-8 left-0 right-0 flex justify-center z-10">
+      <div className="absolute z-10 flex justify-center px-4" style={{ bottom: "max(2rem, calc(env(safe-area-inset-bottom) + 1rem))" }}>
         <BottomIndicator appState={appState} color={stateColor} />
       </div>
+
+      {textFallbackOpen && (
+        <TextFallbackModal
+          color={stateColor}
+          value={textInput}
+          onChange={setTextInput}
+          onSubmit={submitTextFallback}
+          onClose={() => setTextFallbackOpen(false)}
+        />
+      )}
 
       <style>{`
         @keyframes jSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
@@ -634,11 +788,62 @@ export default function JarvisPage() {
           0%,100% { transform: scaleY(0.25); }
           50% { transform: scaleY(1); }
         }
-        @keyframes jOrbit {
-          from { transform: rotate(0deg) translateX(28px) rotate(0deg); }
-          to   { transform: rotate(360deg) translateX(28px) rotate(-360deg); }
+        @media (prefers-reduced-motion: reduce) {
+          * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; }
         }
       `}</style>
+    </div>
+  );
+}
+
+// ─── Text Fallback Modal (for browsers without SpeechRecognition) ────────────
+
+function TextFallbackModal({ color, value, onChange, onSubmit, onClose }: {
+  color: string; value: string; onChange: (v: string) => void; onSubmit: () => void; onClose: () => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => { inputRef.current?.focus(); }, []);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center px-4 pb-[max(1rem,env(safe-area-inset-bottom))]"
+      style={{ background: "rgba(2,6,9,0.75)" }}
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-sm rounded-md p-4 flex flex-col gap-3"
+        style={{ background: "#040b10", border: `1px solid rgba(${color},0.25)` }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <span className="text-[8px] tracking-[0.3em]" style={{ color: `rgba(${color},0.6)` }}>TYPE YOUR QUERY</span>
+        <input
+          ref={inputRef}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") onSubmit(); }}
+          className="w-full rounded-sm px-3 py-2.5 text-sm bg-transparent outline-none"
+          style={{ border: `1px solid rgba(${color},0.3)`, color: `rgba(${color},0.9)` }}
+          placeholder="Ask J.A.R.V.I.S. anything…"
+          autoComplete="off"
+          autoCapitalize="sentences"
+        />
+        <div className="flex gap-2">
+          <button
+            onClick={onClose}
+            className="flex-1 py-2.5 rounded-sm text-[9px] tracking-[0.25em]"
+            style={{ border: `1px solid rgba(${color},0.15)`, color: `rgba(${color},0.5)` }}
+          >
+            CANCEL
+          </button>
+          <button
+            onClick={onSubmit}
+            className="flex-1 py-2.5 rounded-sm text-[9px] tracking-[0.25em]"
+            style={{ border: `1px solid rgba(${color},0.4)`, color: `rgba(${color},0.9)`, background: `rgba(${color},0.08)` }}
+          >
+            SEND
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -647,7 +852,6 @@ export default function JarvisPage() {
 
 function OrbCenter({ appState, color }: { appState: AppState; color: string }) {
   if (appState === "thinking") {
-    // Three orbiting dots
     return (
       <div className="absolute inset-0 flex items-center justify-center">
         <div className="relative w-12 h-12">
@@ -667,7 +871,6 @@ function OrbCenter({ appState, color }: { appState: AppState; color: string }) {
               }} />
             </div>
           ))}
-          {/* Center dot */}
           <div className="absolute inset-0 flex items-center justify-center">
             <div className="rounded-full" style={{
               width: 6, height: 6,
@@ -681,7 +884,6 @@ function OrbCenter({ appState, color }: { appState: AppState; color: string }) {
   }
 
   if (appState === "listening" || appState === "speaking") {
-    // Waveform bars — FIX: use separate animationName / animationDuration etc.
     const heights = appState === "listening"
       ? [5, 12, 9, 18, 8, 14, 9, 18, 8, 12, 5]
       : [6, 14, 10, 20, 14, 24, 14, 20, 10, 14, 6];
@@ -696,7 +898,6 @@ function OrbCenter({ appState, color }: { appState: AppState; color: string }) {
               background: `rgba(${color},0.85)`,
               borderRadius: 2,
               boxShadow: `0 0 6px rgba(${color},0.7)`,
-              // ✅ Fix: separate longhand properties instead of shorthand `animation`
               animationName: "jWave",
               animationDuration: appState === "listening" ? "0.65s" : "0.5s",
               animationTimingFunction: "ease-in-out",
@@ -709,7 +910,6 @@ function OrbCenter({ appState, color }: { appState: AppState; color: string }) {
     );
   }
 
-  // Ready — microphone SVG
   return (
     <div className="absolute inset-0 flex items-center justify-center">
       <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke={`rgba(${color},0.4)`} strokeWidth="1.5" strokeLinecap="round">
@@ -738,7 +938,6 @@ function StateDot({ state, color }: { state: AppState; color: string }) {
         animationTimingFunction: "ease-in-out",
         animationIterationCount: "infinite",
       }} />
-      {/* 4 small tick lines instead of text */}
       <div className="flex gap-1">
         {[1, 1, 0.5, 0.3].map((o, i) => (
           <div key={i} style={{ width: 6, height: 1, background: `rgba(${color},${o * 0.4})`, borderRadius: 1 }} />
@@ -752,7 +951,6 @@ function StateDot({ state, color }: { state: AppState; color: string }) {
 
 function BottomIndicator({ appState, color }: { appState: AppState; color: string }) {
   if (appState === "ready") {
-    // Tap icon: two concentric circles with a dot
     return (
       <div className="flex flex-col items-center gap-2">
         <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
@@ -761,16 +959,15 @@ function BottomIndicator({ appState, color }: { appState: AppState; color: strin
           <circle cx="10" cy="10" r="1.5" fill={`rgba(${color},0.5)`} />
         </svg>
         <div className="flex gap-1">
-          {[4,6,4].map((w,i) => <div key={i} style={{ width: w, height: 1, background: `rgba(${color},0.2)`, borderRadius: 1 }} />)}
+          {[4, 6, 4].map((w, i) => <div key={i} style={{ width: w, height: 1, background: `rgba(${color},0.2)`, borderRadius: 1 }} />)}
         </div>
       </div>
     );
   }
   if (appState === "listening") {
-    // Sound wave icon
     return (
       <svg width="24" height="16" viewBox="0 0 24 16" fill="none">
-        {[0,1,2,3].map((i) => (
+        {[0, 1, 2, 3].map((i) => (
           <rect key={i} x={i * 6} y={4 + i % 2 * 2} width="3" height={8 - i % 2 * 4} rx="1.5"
             fill={`rgba(${color},0.4)`} style={{
               animationName: "jWave", animationDuration: "0.7s", animationTimingFunction: "ease-in-out",
@@ -781,7 +978,6 @@ function BottomIndicator({ appState, color }: { appState: AppState; color: strin
     );
   }
   if (appState === "speaking") {
-    // Speaker wave icon
     return (
       <svg width="22" height="18" viewBox="0 0 22 18" fill="none" style={{ opacity: 0.5 }}>
         <path d="M3 6H1v6h2l5 4V2L3 6z" fill={`rgba(${color},0.4)`} />
@@ -794,7 +990,7 @@ function BottomIndicator({ appState, color }: { appState: AppState; color: strin
   if (appState === "thinking") {
     return (
       <div className="flex gap-2">
-        {[0,200,400].map((d,i) => (
+        {[0, 200, 400].map((d, i) => (
           <div key={i} className="rounded-full" style={{
             width: 5, height: 5,
             background: `rgba(${color},0.5)`,
@@ -825,7 +1021,8 @@ function HudCorners({ color }: { color: string }) {
       {corners.map((style, i) => (
         <div key={i} className="absolute z-20" style={{
           ...Object.fromEntries(Object.entries(style).map(([k, v]) => [k, typeof v === "number" ? (k.startsWith("border") ? `${v}px solid ${c}` : v) : v])),
-          width: size, height: size, margin: 12,
+          width: size, height: size,
+          margin: "max(0.75rem, env(safe-area-inset-top))",
         }} />
       ))}
     </>
@@ -838,15 +1035,15 @@ function PermissionsScreen({ locStatus, micStatus, camStatus, onRequest }: {
   locStatus: PermissionState; micStatus: PermissionState; camStatus: PermissionState; onRequest: () => void;
 }) {
   const items = [
-    { label: "LOCATION", status: locStatus },
-    { label: "MICROPHONE", status: micStatus },
-    { label: "CAMERA", status: camStatus },
+    { label: "LOCATION", status: locStatus, required: true },
+    { label: "MICROPHONE", status: micStatus, required: true },
+    { label: "CAMERA", status: camStatus, required: false },
   ];
   const anyRequesting = items.some((i) => i.status === "requesting");
-  const anyDenied = items.some((i) => i.status === "denied" || i.status === "error");
+  const requiredDenied = items.some((i) => i.required && (i.status === "denied" || i.status === "error" || i.status === "unsupported"));
 
   return (
-    <div className="min-h-screen bg-[#020609] flex flex-col items-center justify-center font-mono relative overflow-hidden">
+    <div className="min-h-[100dvh] bg-[#020609] flex flex-col items-center justify-center font-mono relative overflow-hidden">
       <div className="absolute inset-0" style={{ background: "radial-gradient(ellipse at 50% 40%, #041420 0%, #020609 70%)" }} />
       <div className="absolute inset-0 opacity-[0.03]" style={{
         backgroundImage: "linear-gradient(#00d4ff 1px,transparent 1px),linear-gradient(90deg,#00d4ff 1px,transparent 1px)",
@@ -854,22 +1051,20 @@ function PermissionsScreen({ locStatus, micStatus, camStatus, onRequest }: {
       }} />
       <HudCorners color="0,180,220" />
 
-      <div className="relative z-10 flex flex-col items-center gap-8 px-8 max-w-sm w-full">
-        {/* Logo */}
+      <div className="relative z-10 flex flex-col items-center gap-6 sm:gap-8 px-6 sm:px-8 max-w-sm w-full py-8" style={{ paddingTop: "max(2rem, env(safe-area-inset-top))", paddingBottom: "max(2rem, env(safe-area-inset-bottom))" }}>
         <div className="flex flex-col items-center gap-2">
           <div className="flex items-center gap-3">
             <div className="h-px w-14" style={{ background: "linear-gradient(to right, transparent, rgba(0,212,255,0.4))" }} />
-            <span className="text-[12px] tracking-[0.55em]" style={{ color: "rgba(0,212,255,0.65)" }}>J · A · R · V · I · S</span>
+            <span className="text-[11px] sm:text-[12px] tracking-[0.5em] sm:tracking-[0.55em]" style={{ color: "rgba(0,212,255,0.65)" }}>J · A · R · V · I · S</span>
             <div className="h-px w-14" style={{ background: "linear-gradient(to left, transparent, rgba(0,212,255,0.4))" }} />
           </div>
-          <span className="text-[7px] tracking-[0.3em]" style={{ color: "rgba(0,180,220,0.25)" }}>STARK INDUSTRIES · AUTONOMOUS INTELLIGENCE</span>
+          <span className="text-[7px] tracking-[0.3em] text-center" style={{ color: "rgba(0,180,220,0.25)" }}>STARK INDUSTRIES · AUTONOMOUS INTELLIGENCE</span>
         </div>
 
-        {/* Dormant arc reactor */}
-        <div className="relative flex items-center justify-center" style={{ width: 200, height: 200 }}>
+        <div className="relative flex items-center justify-center" style={{ width: "min(50vw, 200px)", height: "min(50vw, 200px)" }}>
           {[200, 160, 120].map((s, i) => (
             <div key={i} className="absolute rounded-full" style={{
-              width: s, height: s,
+              width: `${(s / 200) * 100}%`, height: `${(s / 200) * 100}%`,
               border: `1px solid rgba(0,212,255,${0.06 - i * 0.015})`,
               animationName: "jSpin",
               animationDuration: `${20 + i * 8}s`,
@@ -879,7 +1074,7 @@ function PermissionsScreen({ locStatus, micStatus, camStatus, onRequest }: {
             }} />
           ))}
           <div className="rounded-full flex items-center justify-center" style={{
-            width: 90, height: 90,
+            width: "45%", height: "45%",
             background: "radial-gradient(circle at 38% 35%, rgba(15,50,70,0.25) 0%, rgba(2,8,15,0.96) 100%)",
             border: "1px solid rgba(0,212,255,0.1)",
             boxShadow: "0 0 30px rgba(0,212,255,0.08)",
@@ -897,16 +1092,17 @@ function PermissionsScreen({ locStatus, micStatus, camStatus, onRequest }: {
           </div>
         </div>
 
-        {/* Permission rows */}
         <div className="w-full flex flex-col gap-2.5">
-          {items.map(({ label, status }) => {
-            const dotColor = status === "granted" ? "74,201,138" : status === "denied" ? "224,85,85" : status === "requesting" ? "245,166,35" : "30,60,80";
+          {items.map(({ label, status, required }) => {
+            const dotColor = status === "granted" ? "74,201,138" : (status === "denied" || status === "unsupported") ? "224,85,85" : status === "requesting" ? "245,166,35" : "30,60,80";
             return (
               <div key={label} className="flex items-center justify-between px-4 py-3 rounded-sm" style={{
                 border: "1px solid rgba(10,26,39,0.9)",
                 background: "rgba(3,10,16,0.85)",
               }}>
-                <span className="text-[8px] tracking-[0.3em]" style={{ color: "rgba(0,180,220,0.5)" }}>{label}</span>
+                <span className="text-[8px] tracking-[0.3em]" style={{ color: "rgba(0,180,220,0.5)" }}>
+                  {label}{!required && <span style={{ opacity: 0.5 }}> · OPTIONAL</span>}
+                </span>
                 <div className="flex items-center gap-2">
                   <div style={{
                     width: 6, height: 6, borderRadius: "50%",
@@ -918,7 +1114,7 @@ function PermissionsScreen({ locStatus, micStatus, camStatus, onRequest }: {
                     animationIterationCount: "infinite",
                   }} />
                   <span className="text-[7px] tracking-[0.25em]" style={{ color: `rgba(${dotColor},0.7)` }}>
-                    {status === "granted" ? "ONLINE" : status === "denied" ? "DENIED" : status === "requesting" ? "INIT" : "OFFLINE"}
+                    {status === "granted" ? "ONLINE" : status === "denied" ? "DENIED" : status === "unsupported" ? "N/A" : status === "requesting" ? "INIT" : "OFFLINE"}
                   </span>
                 </div>
               </div>
@@ -926,18 +1122,22 @@ function PermissionsScreen({ locStatus, micStatus, camStatus, onRequest }: {
           })}
         </div>
 
-        {/* CTA */}
-        {anyDenied ? (
+        {requiredDenied ? (
           <div className="w-full flex flex-col items-center gap-3">
             <div className="flex gap-1">
-              {[6,4,6].map((w,i) => <div key={i} style={{ width: w, height: 1, background: "rgba(224,85,85,0.4)", borderRadius: 1 }} />)}
+              {[6, 4, 6].map((w, i) => <div key={i} style={{ width: w, height: 1, background: "rgba(224,85,85,0.4)", borderRadius: 1 }} />)}
             </div>
-            <button onClick={onRequest} className="px-8 py-2.5 rounded-sm transition-all" style={{
+            <span className="text-[7px] tracking-[0.2em] text-center" style={{ color: "rgba(224,85,85,0.6)" }}>
+              ENABLE LOCATION &amp; MICROPHONE IN BROWSER SETTINGS
+            </span>
+            <button onClick={onRequest} className="px-8 py-2.5 rounded-sm transition-all active:scale-[0.98]" style={{
               border: "1px solid rgba(224,85,85,0.3)",
               color: "rgba(224,85,85,0.65)",
               fontSize: "9px",
               letterSpacing: "0.25em",
               background: "rgba(224,85,85,0.04)",
+              touchAction: "manipulation",
+              WebkitTapHighlightColor: "transparent",
             }}>RETRY</button>
           </div>
         ) : (
@@ -953,6 +1153,8 @@ function PermissionsScreen({ locStatus, micStatus, camStatus, onRequest }: {
               letterSpacing: "0.35em",
               opacity: anyRequesting ? 0.45 : 1,
               cursor: anyRequesting ? "not-allowed" : "pointer",
+              touchAction: "manipulation",
+              WebkitTapHighlightColor: "transparent",
             }}
           >
             {anyRequesting ? "INITIALIZING…" : "INITIALIZE J.A.R.V.I.S."}
@@ -966,6 +1168,9 @@ function PermissionsScreen({ locStatus, micStatus, camStatus, onRequest }: {
         @keyframes jWave { 0%,100% { transform: scaleY(0.25); } 50% { transform: scaleY(1); } }
         @keyframes jBounce { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
         @keyframes jPing { 0% { transform: scale(1); opacity: 0.5; } 100% { transform: scale(1.6); opacity: 0; } }
+        @media (prefers-reduced-motion: reduce) {
+          * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; }
+        }
       `}</style>
     </div>
   );

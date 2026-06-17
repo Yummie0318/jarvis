@@ -471,6 +471,7 @@ function ArcReactorRings({ appState }: { appState: AppState }) {
   );
 }
 
+<<<<<<< HEAD
 // ─── Permissions Screen ─────────────────────────────────────────────────────
 function PermissionRow({
   label,
@@ -839,6 +840,8 @@ function TextFallbackModal({
   );
 }
 
+=======
+>>>>>>> b50d65f21c23ba2370c45bd712a1e158986339b2
 // ─── Main Component ───────────────────────────────────────────────────────────
 export default function JarvisPage() {
   const [appState, setAppState] = useState<AppState>("permissions");

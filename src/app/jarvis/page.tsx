@@ -16,13 +16,6 @@ interface LogEntry {
 }
 
 // ─── Shared Audio Analyser ──────────────────────────────────────────────────
-// One AudioContext for the whole app. We attach different sources to a single
-// AnalyserNode depending on state: the mic stream while listening, or the
-// <audio> element used for TTS playback while speaking. The visualizer reads
-// real frequency data from whichever source is currently active, so the bars
-// genuinely react to the mic's voice input or to JARVIS's spoken reply,
-// instead of a fake sine-wave animation. Web Audio API works the same way
-// across desktop/mobile Chrome, Safari, and Firefox.
 class AudioAnalyserBus {
   ctx: AudioContext | null = null;
   analyser: AnalyserNode | null = null;
@@ -60,14 +53,11 @@ class AudioAnalyserBus {
   detachMic() {
     try { this.micSource?.disconnect(); } catch {}
     this.micSource = null;
-    // Note: we do NOT stop the tracks here — caller owns the stream lifecycle.
     this.micStream = null;
   }
 
   attachTTS(audioEl: HTMLAudioElement) {
     const ctx = this.ensureCtx();
-    // Each <audio> element can only be wrapped in a MediaElementSource once
-    // for its lifetime, so we create a fresh source per new element.
     if (this.ttsEl === audioEl && this.ttsSource) {
       this.ttsSource.connect(this.analyser!);
       return;
@@ -77,13 +67,8 @@ class AudioAnalyserBus {
     try {
       this.ttsSource = ctx.createMediaElementSource(audioEl);
       this.ttsSource.connect(this.analyser!);
-      // Keep audio audible (analyser is a passive tap, but the element's
-      // own output path is cut once routed through Web Audio, so we must
-      // also connect to the destination).
       this.ttsSource.connect(ctx.destination);
     } catch {
-      // If the element was already connected elsewhere this can throw;
-      // fail silently and fall back to idle animation.
       this.ttsSource = null;
     }
   }
@@ -140,7 +125,6 @@ function useTTS() {
         unlockedRef.current = true;
       }
     } catch {}
-    // Also nudge the shared AudioContext awake on the same user gesture.
     try { getAudioBus()?.ctx?.resume(); } catch {}
   }, []);
 
@@ -198,7 +182,11 @@ function useTTS() {
   }, []);
 
   const stop = useCallback(() => {
-    if (audioRef.current) { audioRef.current.pause(); audioRef.current.src = ""; audioRef.current = null; }
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.src = "";
+      audioRef.current = null;
+    }
     try { getAudioBus()?.detachTTS(); } catch {}
     setIsSpeaking(false);
     setIsLoading(false);
@@ -208,18 +196,15 @@ function useTTS() {
   return { speak, stop, unlock, isSpeaking, isLoading };
 }
 
-// ─── STT Hook — manual toggle, no auto-restart ──────────────────────────────
-// Behavior: one tap starts listening and STAYS listening (continuous:true
-// where supported) until the user explicitly taps again to stop. We no
-// longer auto-restart on "no-speech" or on the engine's own onend firing —
-// that was the cause of the endless start/stop/"aborted" loop. The only
-// thing that can stop listening now is the user (stop()) or a hard error
-// that isn't a benign "no-speech"/"aborted" blip.
+// ─── STT Hook ──────────────────────────────────────────────────────────────
 type AnyRecognition = {
   continuous: boolean; interimResults: boolean; lang: string;
   onstart: (() => void) | null; onend: (() => void) | null;
   onerror: ((e: { error: string }) => void) | null;
-  onresult: ((e: { results: { [k: number]: { [k: number]: { transcript: string }; isFinal: boolean }; length: number } }) => void) | null;
+  onresult: ((e: {
+    resultIndex: number;
+    results: { [k: number]: { [k: number]: { transcript: string }; isFinal: boolean }; length: number }
+  }) => void) | null;
   start: () => void; stop: () => void; abort: () => void;
 };
 
@@ -235,11 +220,12 @@ function useSTT(
   onLog: (type: LogEntry["type"], text: string) => void
 ) {
   const recognitionRef = useRef<AnyRecognition | null>(null);
-  // userWantsListeningRef reflects intent: true only between an explicit
-  // start() call and an explicit stop() call (or a fatal error). The engine
-  // restarting itself is NOT allowed to flip this back to true.
   const userWantsListeningRef = useRef(false);
-  const accumulatedFinalRef = useRef(""); // collects finals across engine restarts within one "session"
+  const accumulatedFinalRef = useRef("");
+  // Mirrors the latest interim transcript in a ref so stop() can read it
+  // synchronously — React state (interimText) is not accessible inside
+  // callbacks without stale-closure issues.
+  const latestInterimRef = useRef("");
   const [isListening, setIsListening] = useState(false);
   const [supported, setSupported] = useState(true);
 
@@ -252,28 +238,18 @@ function useSTT(
     if (!SR) { setSupported(false); return null; }
 
     const rec = new SR();
-    // continuous:true keeps the session open on browsers that honor it
-    // (desktop Chrome/Edge). Mobile Safari/Chrome-on-iOS frequently ignore
-    // this and end the session after a pause regardless — we handle that
-    // below by restarting ONLY while the user still wants to be listening,
-    // and we treat that restart as silent/internal, never as a new
-    // "session" the user has to re-trigger.
     rec.continuous = true;
     rec.interimResults = true;
     rec.lang = "en-US";
 
     rec.onstart = () => {
       setIsListening(true);
-      onLog("status", "Mic started — speak now");
+      onLog("status", "Listening… tap again to stop");
     };
 
     rec.onend = () => {
-      // The engine ended the session on its own (common on mobile after
-      // ~60s or a pause). If the user hasn't explicitly stopped, silently
-      // restart the underlying engine so the experience still feels like
-      // one continuous listening session from the user's point of view.
-      // We do NOT log this restart and we do NOT change isListening, so
-      // there is no visible flicker and no "no-speech" spam.
+      // Silently restart if user still wants to listen (handles mobile
+      // engines that end sessions after silence / ~60s timeout).
       if (userWantsListeningRef.current) {
         try {
           const fresh = createRecognition();
@@ -291,39 +267,32 @@ function useSTT(
     };
 
     rec.onerror = (e) => {
-      // "no-speech" and "aborted" are benign/expected (user paused, or we
-      // deliberately called abort() while swapping engines / stopping).
-      // Never log these as user-facing errors and never stop listening
-      // because of them — the onend handler above decides whether to
-      // restart, based solely on user intent.
+      // Benign — don't surface these to the user.
       if (e.error === "no-speech" || e.error === "aborted") return;
-
       console.error("[STT] error:", e.error);
       onLog("error", `Speech error: ${e.error}`);
       if (e.error === "not-allowed" || e.error === "service-not-allowed") {
-        // Permission revoked mid-session — genuinely stop.
         userWantsListeningRef.current = false;
         setIsListening(false);
       }
-      // Other errors: let onend decide (it will restart if user still wants
-      // to listen, since userWantsListeningRef is still true).
     };
 
     rec.onresult = (e) => {
+      // Start from e.resultIndex to avoid re-processing already-finalized results.
       let interimText = "";
-      let newFinal = "";
-      for (let i = 0; i < e.results.length; i++) {
+      for (let i = e.resultIndex; i < e.results.length; i++) {
         const result = e.results[i];
         const transcript = result[0]?.transcript ?? "";
         if (result.isFinal) {
-          newFinal += transcript;
+          accumulatedFinalRef.current = (accumulatedFinalRef.current + " " + transcript).trim();
+          // Once finalized, clear the interim mirror for this chunk.
+          latestInterimRef.current = "";
         } else {
           interimText += transcript;
         }
       }
-      if (newFinal) {
-        accumulatedFinalRef.current = (accumulatedFinalRef.current + " " + newFinal).trim();
-      }
+      // Always keep the ref in sync so stop() can grab it as a fallback.
+      if (interimText) latestInterimRef.current = interimText;
       onInterim(interimText);
     };
 
@@ -331,11 +300,12 @@ function useSTT(
   }, [onInterim, onLog]);
 
   const start = useCallback(() => {
-    if (userWantsListeningRef.current) return; // already listening
+    if (userWantsListeningRef.current) return;
     const SR = getSpeechRecognitionCtor();
     if (!SR) { setSupported(false); return; }
     userWantsListeningRef.current = true;
     accumulatedFinalRef.current = "";
+    latestInterimRef.current = "";
     const rec = createRecognition();
     if (!rec) return;
     recognitionRef.current = rec;
@@ -349,9 +319,8 @@ function useSTT(
     }
   }, [createRecognition, onLog]);
 
-  // Explicit stop: this is the ONLY normal way listening ends. We finalize
-  // whatever transcript we have accumulated (final + any trailing interim)
-  // and hand it to onResult, mirroring "tap to talk, tap again to send."
+  // Explicit stop — fires onResult with whatever was heard (finals first,
+  // interim as fallback). This is the "tap to send" moment.
   const stop = useCallback(() => {
     userWantsListeningRef.current = false;
     try { recognitionRef.current?.stop(); } catch {}
@@ -359,10 +328,21 @@ function useSTT(
     recognitionRef.current = null;
     setIsListening(false);
     onInterim("");
-    const finalText = accumulatedFinalRef.current.trim();
+
+    const finals = accumulatedFinalRef.current.trim();
+    // If the engine hasn't committed a final yet (common when the user
+    // taps stop quickly), fall back to whatever interim text was last seen.
+    const interim = latestInterimRef.current.trim();
     accumulatedFinalRef.current = "";
-    if (finalText) onResult(finalText);
-  }, [onResult, onInterim]);
+    latestInterimRef.current = "";
+
+    const text = finals || interim;
+    if (text) {
+      onResult(text);
+    } else {
+      onLog("status", "No speech detected");
+    }
+  }, [onResult, onInterim, onLog]);
 
   useEffect(() => () => {
     userWantsListeningRef.current = false;
@@ -389,9 +369,9 @@ function TranscriptPanel({ log, interimText, jarvisText, color }: {
   return (
     <div style={{
       position: "absolute",
-      bottom: "max(4.5rem, calc(env(safe-area-inset-bottom) + 4rem))",
-      left: "max(1rem, env(safe-area-inset-left))",
-      right: "max(1rem, env(safe-area-inset-right))",
+      bottom: "max(4.5rem, calc(env(safe-area-inset-bottom, 0px) + 4rem))",
+      left: "max(1rem, env(safe-area-inset-left, 0px))",
+      right: "max(1rem, env(safe-area-inset-right, 0px))",
       zIndex: 20,
       display: "flex",
       flexDirection: "column",
@@ -432,11 +412,13 @@ function TranscriptPanel({ log, interimText, jarvisText, color }: {
           <div style={{ fontSize: 11, color: `rgba(${color},0.3)` }}>Tap orb to start speaking…</div>
         )}
         {log.map((entry) => (
-          <div key={entry.id} style={{ fontSize: 11, color:
-            entry.type === "heard" ? `rgba(${color},0.85)` :
-            entry.type === "reply" ? `rgba(0,220,120,0.75)` :
-            entry.type === "error" ? "rgba(220,60,60,0.85)" :
-            `rgba(${color},0.4)`,
+          <div key={entry.id} style={{
+            fontSize: 11,
+            color:
+              entry.type === "heard" ? `rgba(${color},0.85)` :
+              entry.type === "reply" ? `rgba(0,220,120,0.75)` :
+              entry.type === "error" ? "rgba(220,60,60,0.85)" :
+              `rgba(${color},0.4)`,
             lineHeight: 1.4,
           }}>
             {entry.type === "heard" && "🎤 "}
@@ -455,10 +437,7 @@ function TranscriptPanel({ log, interimText, jarvisText, color }: {
   );
 }
 
-// ─── Audio Visualizer Canvas — now reads REAL audio levels ────────────────
-// While listening: analyses the live mic stream. While speaking: analyses
-// the TTS <audio> element's own output. Otherwise: a gentle idle breathing
-// animation (no fake "fake-bass" theatrics during idle/thinking).
+// ─── Audio Visualizer Canvas ────────────────────────────────────────────────
 function AudioVisualizer({ appState, micStream }: { appState: AppState; micStream: MediaStream | null }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animRef = useRef<number>(0);
@@ -472,8 +451,6 @@ function AudioVisualizer({ appState, micStream }: { appState: AppState; micStrea
     if (appState === "listening" && micStream) {
       bus.attachMic(micStream);
     } else if (appState !== "speaking") {
-      // Only detach mic when we're not actively listening; TTS attach/detach
-      // is managed by useTTS itself.
       bus.detachMic();
     }
     return () => {
@@ -516,8 +493,6 @@ function AudioVisualizer({ appState, micStream }: { appState: AppState; micStrea
 
       barsRef.current = barsRef.current.map((v, i) => {
         if (hasSignal && liveLevels) {
-          // Real audio-reactive target, mapped with a touch of gain so
-          // quiet speech still reads as visible movement.
           const target = Math.min(1, liveLevels[i] * 1.6);
           return v + (target - v) * 0.35;
         }
@@ -529,9 +504,6 @@ function AudioVisualizer({ appState, micStream }: { appState: AppState; micStrea
           const target = 0.15 + 0.15 * Math.sin(t * 1.2 + i * (Math.PI * 2 / BAR_COUNT) * 3);
           return v + (target - v) * 0.06;
         }
-        // Active (listening/speaking) but no signal yet (e.g. mic just
-        // opened, or TTS buffering) — gentle idle-active shimmer instead of
-        // going fully flat, so the orb doesn't look broken.
         const target = 0.08 + 0.06 * Math.sin(t * 1.5 + i * 0.4);
         return v + (target - v) * 0.1;
       });
@@ -633,15 +605,7 @@ function ArcReactorRings({ appState }: { appState: AppState }) {
 }
 
 // ─── Permissions Screen ─────────────────────────────────────────────────────
-function PermissionRow({
-  label,
-  status,
-  color,
-}: {
-  label: string;
-  status: PermissionState;
-  color: string;
-}) {
+function PermissionRow({ label, status, color }: { label: string; status: PermissionState; color: string }) {
   const statusText =
     status === "idle" ? "PENDING" :
     status === "requesting" ? "REQUESTING…" :
@@ -661,18 +625,14 @@ function PermissionRow({
         {label}
       </span>
       <div className="flex items-center gap-2">
-        <div
-          className="rounded-full"
-          style={{
-            width: 6,
-            height: 6,
-            background: `rgba(${statusColor},0.9)`,
-            boxShadow: `0 0 8px rgba(${statusColor},0.7)`,
-            animationName: status === "requesting" ? "jPulse" : "none",
-            animationDuration: "1s",
-            animationIterationCount: "infinite",
-          }}
-        />
+        <div className="rounded-full" style={{
+          width: 6, height: 6,
+          background: `rgba(${statusColor},0.9)`,
+          boxShadow: `0 0 8px rgba(${statusColor},0.7)`,
+          animationName: status === "requesting" ? "jPulse" : "none",
+          animationDuration: "1s",
+          animationIterationCount: "infinite",
+        }} />
         <span className="text-[9px] sm:text-[10px] tracking-[0.2em]" style={{ color: `rgba(${statusColor},0.85)` }}>
           {statusText}
         </span>
@@ -681,12 +641,7 @@ function PermissionRow({
   );
 }
 
-function PermissionsScreen({
-  locStatus,
-  micStatus,
-  camStatus,
-  onRequest,
-}: {
+function PermissionsScreen({ locStatus, micStatus, camStatus, onRequest }: {
   locStatus: PermissionState;
   micStatus: PermissionState;
   camStatus: PermissionState;
@@ -698,17 +653,9 @@ function PermissionsScreen({
   const buttonLabel = anyRequesting ? "REQUESTING ACCESS…" : anyDenied ? "RETRY AUTHORIZATION" : "INITIALIZE SYSTEMS";
 
   return (
-    <div
-      className="min-h-[100dvh] bg-[#020609] flex flex-col items-center justify-center font-mono overflow-hidden relative select-none px-6"
-      style={{ touchAction: "manipulation" }}
-    >
-      <div className="absolute inset-0" style={{
-        background: `radial-gradient(ellipse at 50% 50%, rgba(${color},0.05) 0%, #020609 55%, #010305 100%)`,
-      }} />
-      <div className="absolute inset-0 opacity-[0.025]" style={{
-        backgroundImage: "linear-gradient(#00d4ff 1px,transparent 1px),linear-gradient(90deg,#00d4ff 1px,transparent 1px)",
-        backgroundSize: "80px 80px",
-      }} />
+    <div className="min-h-[100dvh] bg-[#020609] flex flex-col items-center justify-center font-mono overflow-hidden relative select-none px-6" style={{ touchAction: "manipulation" }}>
+      <div className="absolute inset-0" style={{ background: `radial-gradient(ellipse at 50% 50%, rgba(${color},0.05) 0%, #020609 55%, #010305 100%)` }} />
+      <div className="absolute inset-0 opacity-[0.025]" style={{ backgroundImage: "linear-gradient(#00d4ff 1px,transparent 1px),linear-gradient(90deg,#00d4ff 1px,transparent 1px)", backgroundSize: "80px 80px" }} />
 
       <HudCorners color={color} />
 
@@ -716,46 +663,20 @@ function PermissionsScreen({
         <div className="flex flex-col items-center gap-2">
           <div className="flex items-center gap-3 sm:gap-4">
             <div className="h-px w-12 sm:w-16" style={{ background: `linear-gradient(to right, transparent, rgba(${color},0.4))` }} />
-            <span className="text-[10px] sm:text-[12px] tracking-[0.5em] sm:tracking-[0.6em]" style={{ color: `rgba(${color},0.6)` }}>
-              J · A · R · V · I · S
-            </span>
+            <span className="text-[10px] sm:text-[12px] tracking-[0.5em] sm:tracking-[0.6em]" style={{ color: `rgba(${color},0.6)` }}>J · A · R · V · I · S</span>
             <div className="h-px w-12 sm:w-16" style={{ background: `linear-gradient(to left, transparent, rgba(${color},0.4))` }} />
           </div>
-          <span className="text-[7px] sm:text-[8px] tracking-[0.3em] text-center" style={{ color: `rgba(${color},0.25)` }}>
-            STARK INDUSTRIES · AUTONOMOUS INTELLIGENCE
-          </span>
+          <span className="text-[7px] sm:text-[8px] tracking-[0.3em] text-center" style={{ color: `rgba(${color},0.25)` }}>STARK INDUSTRIES · AUTONOMOUS INTELLIGENCE</span>
         </div>
 
-        <div
-          className="w-full flex flex-col gap-4 px-5 py-5 rounded-sm"
-          style={{
-            border: `1px solid rgba(${color},0.18)`,
-            background: "rgba(3,10,16,0.6)",
-            boxShadow: `0 0 30px rgba(${color},0.06) inset`,
-          }}
-        >
-          <span className="text-[8px] tracking-[0.3em]" style={{ color: `rgba(${color},0.4)` }}>
-            SYSTEM AUTHORIZATION REQUIRED
-          </span>
+        <div className="w-full flex flex-col gap-4 px-5 py-5 rounded-sm" style={{ border: `1px solid rgba(${color},0.18)`, background: "rgba(3,10,16,0.6)", boxShadow: `0 0 30px rgba(${color},0.06) inset` }}>
+          <span className="text-[8px] tracking-[0.3em]" style={{ color: `rgba(${color},0.4)` }}>SYSTEM AUTHORIZATION REQUIRED</span>
           <PermissionRow label="LOCATION" status={locStatus} color={color} />
           <PermissionRow label="MICROPHONE" status={micStatus} color={color} />
           <PermissionRow label="CAMERA" status={camStatus} color={color} />
         </div>
 
-        <button
-          type="button"
-          onClick={onRequest}
-          disabled={anyRequesting}
-          className="w-full py-3 rounded-sm text-[10px] sm:text-[11px] tracking-[0.3em] transition-all duration-300"
-          style={{
-            border: `1px solid rgba(${color},0.5)`,
-            color: `rgba(${color},0.9)`,
-            background: `rgba(${color},0.07)`,
-            boxShadow: `0 0 20px rgba(${color},0.12)`,
-            cursor: anyRequesting ? "not-allowed" : "pointer",
-            opacity: anyRequesting ? 0.6 : 1,
-          }}
-        >
+        <button type="button" onClick={onRequest} disabled={anyRequesting} className="w-full py-3 rounded-sm text-[10px] sm:text-[11px] tracking-[0.3em] transition-all duration-300" style={{ border: `1px solid rgba(${color},0.5)`, color: `rgba(${color},0.9)`, background: `rgba(${color},0.07)`, boxShadow: `0 0 20px rgba(${color},0.12)`, cursor: anyRequesting ? "not-allowed" : "pointer", opacity: anyRequesting ? 0.6 : 1 }}>
           {buttonLabel}
         </button>
 
@@ -770,32 +691,35 @@ function PermissionsScreen({
 }
 
 // ─── HUD Corner Brackets ─────────────────────────────────────────────────────
+// FIX: Removed borderColor from base style. Instead, each corner's border-side
+// properties include the full value (e.g. "1px solid rgba(...)") so React
+// never sees borderColor and borderTop/Left/Right/Bottom on the same element
+// at the same time — which was causing the "conflicting shorthand" warnings.
 function HudCorners({ color }: { color: string }) {
-  const cornerStyle = (pos: "tl" | "tr" | "bl" | "br"): React.CSSProperties => {
-    const base: React.CSSProperties = {
-      position: "absolute",
-      width: "min(7vw, 36px)",
-      height: "min(7vw, 36px)",
-      borderColor: `rgba(${color},0.3)`,
-    };
-    const inset = "max(0.75rem, env(safe-area-inset-top))";
-    const insetBottom = "max(0.75rem, env(safe-area-inset-bottom))";
-    const insetLeft = "max(0.75rem, env(safe-area-inset-left))";
-    const insetRight = "max(0.75rem, env(safe-area-inset-right))";
-    switch (pos) {
-      case "tl": return { ...base, top: inset, left: insetLeft, borderTop: "1px solid", borderLeft: "1px solid", borderColor: `rgba(${color},0.3)` };
-      case "tr": return { ...base, top: inset, right: insetRight, borderTop: "1px solid", borderRight: "1px solid", borderColor: `rgba(${color},0.3)` };
-      case "bl": return { ...base, bottom: insetBottom, left: insetLeft, borderBottom: "1px solid", borderLeft: "1px solid", borderColor: `rgba(${color},0.3)` };
-      case "br": return { ...base, bottom: insetBottom, right: insetRight, borderBottom: "1px solid", borderRight: "1px solid", borderColor: `rgba(${color},0.3)` };
-    }
+  const borderVal = `1px solid rgba(${color},0.3)`;
+  const w = "min(7vw, 36px)";
+  const h = "min(7vw, 36px)";
+  const insetTop = "max(0.75rem, env(safe-area-inset-top, 0px))";
+  const insetBottom = "max(0.75rem, env(safe-area-inset-bottom, 0px))";
+  const insetLeft = "max(0.75rem, env(safe-area-inset-left, 0px))";
+  const insetRight = "max(0.75rem, env(safe-area-inset-right, 0px))";
+
+  const base: React.CSSProperties = {
+    position: "absolute",
+    width: w,
+    height: h,
   };
 
   return (
     <div className="absolute inset-0 pointer-events-none z-10">
-      <div style={cornerStyle("tl")} />
-      <div style={cornerStyle("tr")} />
-      <div style={cornerStyle("bl")} />
-      <div style={cornerStyle("br")} />
+      {/* Top-left */}
+      <div style={{ ...base, top: insetTop, left: insetLeft, borderTop: borderVal, borderLeft: borderVal }} />
+      {/* Top-right */}
+      <div style={{ ...base, top: insetTop, right: insetRight, borderTop: borderVal, borderRight: borderVal }} />
+      {/* Bottom-left */}
+      <div style={{ ...base, bottom: insetBottom, left: insetLeft, borderBottom: borderVal, borderLeft: borderVal }} />
+      {/* Bottom-right */}
+      <div style={{ ...base, bottom: insetBottom, right: insetRight, borderBottom: borderVal, borderRight: borderVal }} />
     </div>
   );
 }
@@ -810,18 +734,14 @@ function StateDot({ state, color }: { state: AppState; color: string }) {
 
   return (
     <div className="flex items-center gap-2">
-      <div
-        className="rounded-full"
-        style={{
-          width: 6,
-          height: 6,
-          background: `rgba(${color},0.9)`,
-          boxShadow: `0 0 10px rgba(${color},0.8)`,
-          animationName: state === "ready" ? "jPulse" : "none",
-          animationDuration: "2s",
-          animationIterationCount: "infinite",
-        }}
-      />
+      <div className="rounded-full" style={{
+        width: 6, height: 6,
+        background: `rgba(${color},0.9)`,
+        boxShadow: `0 0 10px rgba(${color},0.8)`,
+        animationName: state === "ready" ? "jPulse" : "none",
+        animationDuration: "2s",
+        animationIterationCount: "infinite",
+      }} />
       <span className="text-[9px] sm:text-[10px] tracking-[0.35em]" style={{ color: `rgba(${color},0.55)` }}>
         {label}
       </span>
@@ -836,21 +756,16 @@ function OrbCenter({ appState, color }: { appState: AppState; color: string }) {
       <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
         <div className="flex gap-1.5">
           {[0, 1, 2].map((i) => (
-            <div
-              key={i}
-              className="rounded-full"
-              style={{
-                width: 6,
-                height: 6,
-                background: `rgba(${color},0.85)`,
-                boxShadow: `0 0 8px rgba(${color},0.6)`,
-                animationName: "jBounce",
-                animationDuration: "1.1s",
-                animationTimingFunction: "ease-in-out",
-                animationIterationCount: "infinite",
-                animationDelay: `${i * 0.15}s`,
-              }}
-            />
+            <div key={i} className="rounded-full" style={{
+              width: 6, height: 6,
+              background: `rgba(${color},0.85)`,
+              boxShadow: `0 0 8px rgba(${color},0.6)`,
+              animationName: "jBounce",
+              animationDuration: "1.1s",
+              animationTimingFunction: "ease-in-out",
+              animationIterationCount: "infinite",
+              animationDelay: `${i * 0.15}s`,
+            }} />
           ))}
         </div>
       </div>
@@ -862,22 +777,18 @@ function OrbCenter({ appState, color }: { appState: AppState; color: string }) {
       <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
         <div className="flex items-end gap-[3px]" style={{ height: 22 }}>
           {[0, 1, 2, 3, 4].map((i) => (
-            <div
-              key={i}
-              style={{
-                width: 3,
-                height: "100%",
-                background: `rgba(${color},0.85)`,
-                boxShadow: `0 0 6px rgba(${color},0.5)`,
-                borderRadius: 2,
-                animationName: "jWave",
-                animationDuration: "0.9s",
-                animationTimingFunction: "ease-in-out",
-                animationIterationCount: "infinite",
-                animationDelay: `${i * 0.08}s`,
-                transformOrigin: "bottom",
-              }}
-            />
+            <div key={i} style={{
+              width: 3, height: "100%",
+              background: `rgba(${color},0.85)`,
+              boxShadow: `0 0 6px rgba(${color},0.5)`,
+              borderRadius: 2,
+              animationName: "jWave",
+              animationDuration: "0.9s",
+              animationTimingFunction: "ease-in-out",
+              animationIterationCount: "infinite",
+              animationDelay: `${i * 0.08}s`,
+              transformOrigin: "bottom",
+            }} />
           ))}
         </div>
       </div>
@@ -886,20 +797,16 @@ function OrbCenter({ appState, color }: { appState: AppState; color: string }) {
 
   return (
     <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-      <div
-        className="rounded-full"
-        style={{
-          width: "22%",
-          height: "22%",
-          background: `radial-gradient(circle, rgba(${color},0.9) 0%, rgba(${color},0.3) 60%, transparent 100%)`,
-          boxShadow: `0 0 ${appState === "speaking" ? 24 : 14}px rgba(${color},0.6)`,
-        }}
-      />
+      <div className="rounded-full" style={{
+        width: "22%", height: "22%",
+        background: `radial-gradient(circle, rgba(${color},0.9) 0%, rgba(${color},0.3) 60%, transparent 100%)`,
+        boxShadow: `0 0 ${appState === "speaking" ? 24 : 14}px rgba(${color},0.6)`,
+      }} />
     </div>
   );
 }
 
-// ─── Bottom Indicator (hint text) ────────────────────────────────────────────
+// ─── Bottom Indicator ────────────────────────────────────────────────────────
 function BottomIndicator({ appState, color }: { appState: AppState; color: string }) {
   const text =
     appState === "listening" ? "TAP TO STOP & SEND" :
@@ -910,53 +817,29 @@ function BottomIndicator({ appState, color }: { appState: AppState; color: strin
   return (
     <div className="flex items-center gap-3">
       <div className="h-px w-6" style={{ background: `linear-gradient(to right, transparent, rgba(${color},0.3))` }} />
-      <span className="text-[8px] sm:text-[9px] tracking-[0.3em]" style={{ color: `rgba(${color},0.4)` }}>
-        {text}
-      </span>
+      <span className="text-[8px] sm:text-[9px] tracking-[0.3em]" style={{ color: `rgba(${color},0.4)` }}>{text}</span>
       <div className="h-px w-6" style={{ background: `linear-gradient(to left, transparent, rgba(${color},0.3))` }} />
     </div>
   );
 }
 
 // ─── Text Fallback Modal ──────────────────────────────────────────────────────
-function TextFallbackModal({
-  color,
-  value,
-  onChange,
-  onSubmit,
-  onClose,
-}: {
-  color: string;
-  value: string;
+function TextFallbackModal({ color, value, onChange, onSubmit, onClose }: {
+  color: string; value: string;
   onChange: (v: string) => void;
   onSubmit: () => void;
   onClose: () => void;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
-
   useEffect(() => {
     const t = setTimeout(() => inputRef.current?.focus(), 50);
     return () => clearTimeout(t);
   }, []);
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center px-6"
-      style={{ background: "rgba(2,6,9,0.85)", backdropFilter: "blur(4px)" }}
-      onClick={onClose}
-    >
-      <div
-        className="w-full max-w-sm flex flex-col gap-4 px-5 py-5 rounded-sm"
-        style={{
-          border: `1px solid rgba(${color},0.3)`,
-          background: "rgba(3,10,16,0.95)",
-          boxShadow: `0 0 40px rgba(${color},0.1)`,
-        }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <span className="text-[9px] tracking-[0.3em]" style={{ color: `rgba(${color},0.5)` }}>
-          MANUAL INPUT
-        </span>
+    <div className="fixed inset-0 z-50 flex items-center justify-center px-6" style={{ background: "rgba(2,6,9,0.85)", backdropFilter: "blur(4px)" }} onClick={onClose}>
+      <div className="w-full max-w-sm flex flex-col gap-4 px-5 py-5 rounded-sm" style={{ border: `1px solid rgba(${color},0.3)`, background: "rgba(3,10,16,0.95)", boxShadow: `0 0 40px rgba(${color},0.1)` }} onClick={(e) => e.stopPropagation()}>
+        <span className="text-[9px] tracking-[0.3em]" style={{ color: `rgba(${color},0.5)` }}>MANUAL INPUT</span>
         <input
           ref={inputRef}
           type="text"
@@ -965,34 +848,11 @@ function TextFallbackModal({
           onKeyDown={(e) => { if (e.key === "Enter") onSubmit(); if (e.key === "Escape") onClose(); }}
           placeholder="Type your query, sir…"
           className="w-full bg-transparent outline-none text-[14px] py-2 px-1"
-          style={{
-            color: `rgba(${color},0.9)`,
-            borderBottom: `1px solid rgba(${color},0.25)`,
-          }}
+          style={{ color: `rgba(${color},0.9)`, borderBottom: `1px solid rgba(${color},0.25)` }}
         />
         <div className="flex gap-3 justify-end">
-          <button
-            type="button"
-            onClick={onClose}
-            className="px-4 py-2 text-[9px] tracking-[0.25em] rounded-sm"
-            style={{ color: `rgba(${color},0.5)`, border: `1px solid rgba(${color},0.15)` }}
-          >
-            CANCEL
-          </button>
-          <button
-            type="button"
-            onClick={onSubmit}
-            disabled={!value.trim()}
-            className="px-4 py-2 text-[9px] tracking-[0.25em] rounded-sm"
-            style={{
-              color: `rgba(${color},0.95)`,
-              border: `1px solid rgba(${color},0.5)`,
-              background: `rgba(${color},0.08)`,
-              opacity: value.trim() ? 1 : 0.4,
-            }}
-          >
-            SEND
-          </button>
+          <button type="button" onClick={onClose} className="px-4 py-2 text-[9px] tracking-[0.25em] rounded-sm" style={{ color: `rgba(${color},0.5)`, border: `1px solid rgba(${color},0.15)` }}>CANCEL</button>
+          <button type="button" onClick={onSubmit} disabled={!value.trim()} className="px-4 py-2 text-[9px] tracking-[0.25em] rounded-sm" style={{ color: `rgba(${color},0.95)`, border: `1px solid rgba(${color},0.5)`, background: `rgba(${color},0.08)`, opacity: value.trim() ? 1 : 0.4 }}>SEND</button>
         </div>
       </div>
     </div>
@@ -1021,9 +881,6 @@ export default function JarvisPage() {
   const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);
   const [weather, setWeather] = useState<{ temperature: number; description: string; units: { temperature: string } } | null>(null);
 
-  // Persistent mic stream, kept alive (but not necessarily feeding the
-  // recognizer) so the visualizer can analyse it the instant listening
-  // starts, and so we don't have to re-prompt for permission every toggle.
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
 
@@ -1083,12 +940,16 @@ export default function JarvisPage() {
       setJarvisText(reply);
       addLog("reply", reply);
       setMessages((prev) => [...prev, { role: "assistant", content: reply }]);
+      // FIX: set appState to "speaking" BEFORE calling speak() so the orb
+      // transitions immediately, instead of briefly flashing back to "ready".
+      setAppState("speaking");
       await speak(reply);
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") return;
       const errMsg = "Systems experiencing interference, sir. Please repeat your query.";
       setJarvisText(errMsg);
       addLog("error", errMsg);
+      setAppState("speaking");
       await speak(errMsg);
     } finally {
       setAppState("ready");
@@ -1105,12 +966,18 @@ export default function JarvisPage() {
     addLog
   );
 
+  // FIX: Simplified state sync. We only sync listening→"listening" here.
+  // The "thinking"→"speaking"→"ready" transitions are driven explicitly in
+  // handleVoiceInput above, so we don't need to watch isSpeaking/ttsLoading
+  // here and risk a race condition with the "thinking" state.
   useEffect(() => {
-    if (appState === "thinking") return;
-    if (ttsLoading || isSpeaking) { setAppState("speaking"); return; }
-    if (isListening) { setAppState("listening"); return; }
-    if (appState === "speaking" || appState === "listening") setAppState("ready");
-  }, [isSpeaking, ttsLoading, isListening]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (appState === "thinking" || appState === "speaking") return;
+    if (isListening) {
+      setAppState("listening");
+    } else if (appState === "listening") {
+      setAppState("ready");
+    }
+  }, [isListening]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (allGranted && appState === "permissions") {
@@ -1170,15 +1037,23 @@ export default function JarvisPage() {
     micStreamRef.current?.getTracks().forEach((t) => t.stop());
   }, []);
 
-  // Strict manual toggle: tap once to start listening, tap again to stop +
-  // send. Nothing here auto-starts or auto-stops on its own.
   const activateOrb = useCallback(() => {
     if (!allGranted) return;
     if (appState === "listening") {
+      // User taps to stop — STT hook will fire onResult with whatever was said.
       stopSTT();
       return;
     }
-    if (appState === "speaking") { stopTTS(); return; }
+    if (appState === "speaking") {
+  stopTTS();
+  if (sttSupported) {
+    addLog("status", "Listening… tap again to stop");
+    startSTT();
+  } else {
+    setAppState("ready");
+  }
+  return;
+}
     if (appState === "thinking") { abortRef.current?.abort(); setAppState("ready"); return; }
     if (appState === "ready") {
       if (!sttSupported) { setTextFallbackOpen(true); return; }
@@ -1187,12 +1062,6 @@ export default function JarvisPage() {
     }
   }, [appState, allGranted, sttSupported, startSTT, stopSTT, stopTTS, addLog]);
 
-  // Single, simple click handler. We removed the previous pointerup+click
-  // double-handling (which existed to dedupe synthetic mobile click events)
-  // because it could occasionally swallow a legitimate second tap meant to
-  // stop listening. A plain onClick fires exactly once per tap/click across
-  // modern mobile and desktop browsers, which is what "tap to start, tap
-  // again to stop" needs.
   const handleClick = useCallback(() => {
     activateOrb();
   }, [activateOrb]);
@@ -1234,7 +1103,7 @@ export default function JarvisPage() {
 
       <HudCorners color={stateColor} />
 
-      <div className="absolute top-[max(1.5rem,env(safe-area-inset-top))] left-0 right-0 flex flex-col items-center gap-1 z-10 px-4">
+      <div className="absolute top-[max(1.5rem,env(safe-area-inset-top,0px))] left-0 right-0 flex flex-col items-center gap-1 z-10 px-4">
         <div className="flex items-center gap-3 sm:gap-4">
           <div className="h-px w-12 sm:w-20" style={{ background: `linear-gradient(to right, transparent, rgba(${stateColor},0.4))` }} />
           <span className="text-[9px] sm:text-[11px] tracking-[0.5em] sm:tracking-[0.6em] whitespace-nowrap" style={{ color: `rgba(${stateColor},0.55)` }}>J · A · R · V · I · S</span>
@@ -1243,12 +1112,12 @@ export default function JarvisPage() {
         <span className="text-[6px] sm:text-[7px] tracking-[0.3em] sm:tracking-[0.35em] text-center" style={{ color: `rgba(${stateColor},0.2)` }}>STARK INDUSTRIES · AUTONOMOUS INTELLIGENCE</span>
       </div>
 
-      <div className="absolute z-10" style={{ top: "max(5.5rem, calc(env(safe-area-inset-top) + 4.5rem))" }}>
+      <div className="absolute z-10" style={{ top: "max(5.5rem, calc(env(safe-area-inset-top, 0px) + 4.5rem))" }}>
         <StateDot state={appState} color={stateColor} />
       </div>
 
       {weather && (
-        <div className="absolute z-10 flex flex-col items-end gap-0.5" style={{ top: "max(1.5rem, env(safe-area-inset-top))", right: "max(1rem, env(safe-area-inset-right))" }}>
+        <div className="absolute z-10 flex flex-col items-end gap-0.5" style={{ top: "max(1.5rem, env(safe-area-inset-top, 0px))", right: "max(1rem, env(safe-area-inset-right, 0px))" }}>
           <span className="text-[11px] font-light" style={{ color: `rgba(${stateColor},0.5)` }}>
             {weather.temperature}{weather.units.temperature}
           </span>
@@ -1257,7 +1126,7 @@ export default function JarvisPage() {
 
       {!sttSupported && (
         <div className="absolute z-10 px-3 py-1 rounded-sm text-[7px] tracking-[0.2em]" style={{
-          top: "max(8.5rem, calc(env(safe-area-inset-top) + 7.5rem))",
+          top: "max(8.5rem, calc(env(safe-area-inset-top, 0px) + 7.5rem))",
           border: `1px solid rgba(${stateColor},0.2)`,
           color: `rgba(${stateColor},0.5)`,
           background: "rgba(3,10,16,0.7)",
@@ -1266,14 +1135,13 @@ export default function JarvisPage() {
         </div>
       )}
 
+      {/* Orb — sized to never exceed available viewport space */}
       <div
         className="relative z-10 flex items-center justify-center"
         style={{
-          width: "min(85vw, 420px)",
-          height: "min(85vw, 420px)",
-          maxWidth: "min(85vh, 420px)",
-          maxHeight: "min(85vh, 420px)",
-          marginBottom: "min(30vw, 140px)",
+          width: "min(85vw, 85vh, 420px)",
+          height: "min(85vw, 85vh, 420px)",
+          marginBottom: "min(25vw, 25vh, 140px)",
         }}
       >
         <AudioVisualizer appState={appState} micStream={micStream} />
@@ -1290,11 +1158,19 @@ export default function JarvisPage() {
           type="button"
           onClick={handleClick}
           disabled={appState === "thinking"}
-          aria-label={appState === "listening" ? "Stop listening and send" : appState === "speaking" ? "Stop speaking" : appState === "thinking" ? "Processing" : "Start voice input"}
+          aria-label={
+            appState === "listening" ? "Stop listening and send" :
+            appState === "speaking" ? "Stop speaking" :
+            appState === "thinking" ? "Processing" :
+            "Start voice input"
+          }
           aria-pressed={appState === "listening"}
           className="absolute rounded-full focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 transition-all duration-700"
           style={{
-            width: "36%", height: "36%", minWidth: 120, minHeight: 120,
+            // FIX: use percentage sizing only — no fixed minWidth/minHeight
+            // that could overflow small phone screens.
+            width: "36%",
+            height: "36%",
             outlineColor: `rgba(${stateColor},0.6)`,
             WebkitTapHighlightColor: "transparent",
             touchAction: "manipulation",
@@ -1304,7 +1180,11 @@ export default function JarvisPage() {
               appState === "speaking" ? "radial-gradient(circle at 38% 35%, rgba(80,230,255,0.25) 0%, rgba(0,130,200,0.15) 45%, rgba(1,10,20,0.94) 100%)" :
               "radial-gradient(circle at 38% 35%, rgba(20,130,180,0.1) 0%, rgba(0,50,80,0.06) 45%, rgba(2,8,16,0.95) 100%)",
             border: `1px solid rgba(${stateColor},${isActive ? 0.55 : 0.18})`,
-            boxShadow: isActive ? `0 0 80px rgba(${stateColor},0.35), 0 0 30px rgba(${stateColor},0.18) inset, 0 0 120px rgba(${stateColor},0.12)` : appState === "thinking" ? `0 0 40px rgba(${stateColor},0.2), 0 0 12px rgba(${stateColor},0.08) inset` : `0 0 18px rgba(${stateColor},0.08)`,
+            boxShadow: isActive
+              ? `0 0 80px rgba(${stateColor},0.35), 0 0 30px rgba(${stateColor},0.18) inset, 0 0 120px rgba(${stateColor},0.12)`
+              : appState === "thinking"
+              ? `0 0 40px rgba(${stateColor},0.2), 0 0 12px rgba(${stateColor},0.08) inset`
+              : `0 0 18px rgba(${stateColor},0.08)`,
             cursor: appState === "thinking" ? "not-allowed" : "pointer",
           }}
         >
@@ -1320,7 +1200,7 @@ export default function JarvisPage() {
         color={stateColor}
       />
 
-      <div className="absolute z-10 flex justify-center px-4" style={{ bottom: "max(0.5rem, calc(env(safe-area-inset-bottom) + 0.25rem))" }}>
+      <div className="absolute z-10 flex justify-center px-4" style={{ bottom: "max(0.5rem, calc(env(safe-area-inset-bottom, 0px) + 0.25rem))" }}>
         <BottomIndicator appState={appState} color={stateColor} />
       </div>
 

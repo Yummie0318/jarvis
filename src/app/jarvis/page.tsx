@@ -9,19 +9,115 @@ interface Message {
   content: string;
 }
 
-// ─── NEW: Transcript log entry for debug panel ─────────────────────────────
 interface LogEntry {
   id: number;
   type: "interim" | "heard" | "reply" | "error" | "status";
   text: string;
 }
 
-function isIOS() {
-  if (typeof navigator === "undefined") return false;
-  const ua = navigator.userAgent;
-  const iOSDevice = /iPad|iPhone|iPod/.test(ua);
-  const iPadOS13Up = navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
-  return iOSDevice || iPadOS13Up;
+// ─── Shared Audio Analyser ──────────────────────────────────────────────────
+// One AudioContext for the whole app. We attach different sources to a single
+// AnalyserNode depending on state: the mic stream while listening, or the
+// <audio> element used for TTS playback while speaking. The visualizer reads
+// real frequency data from whichever source is currently active, so the bars
+// genuinely react to the mic's voice input or to JARVIS's spoken reply,
+// instead of a fake sine-wave animation. Web Audio API works the same way
+// across desktop/mobile Chrome, Safari, and Firefox.
+class AudioAnalyserBus {
+  ctx: AudioContext | null = null;
+  analyser: AnalyserNode | null = null;
+  data: Uint8Array = new Uint8Array(0);
+  private micSource: MediaStreamAudioSourceNode | null = null;
+  private micStream: MediaStream | null = null;
+  private ttsSource: MediaElementAudioSourceNode | null = null;
+  private ttsEl: HTMLAudioElement | null = null;
+
+  private ensureCtx() {
+    if (!this.ctx) {
+      const Ctor = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      this.ctx = new Ctor();
+    }
+    if (this.ctx.state === "suspended") {
+      this.ctx.resume().catch(() => {});
+    }
+    if (!this.analyser) {
+      this.analyser = this.ctx.createAnalyser();
+      this.analyser.fftSize = 256;
+      this.analyser.smoothingTimeConstant = 0.75;
+      this.data = new Uint8Array(this.analyser.frequencyBinCount);
+    }
+    return this.ctx;
+  }
+
+  attachMic(stream: MediaStream) {
+    const ctx = this.ensureCtx();
+    this.detachMic();
+    this.micStream = stream;
+    this.micSource = ctx.createMediaStreamSource(stream);
+    this.micSource.connect(this.analyser!);
+  }
+
+  detachMic() {
+    try { this.micSource?.disconnect(); } catch {}
+    this.micSource = null;
+    // Note: we do NOT stop the tracks here — caller owns the stream lifecycle.
+    this.micStream = null;
+  }
+
+  attachTTS(audioEl: HTMLAudioElement) {
+    const ctx = this.ensureCtx();
+    // Each <audio> element can only be wrapped in a MediaElementSource once
+    // for its lifetime, so we create a fresh source per new element.
+    if (this.ttsEl === audioEl && this.ttsSource) {
+      this.ttsSource.connect(this.analyser!);
+      return;
+    }
+    this.detachTTS();
+    this.ttsEl = audioEl;
+    try {
+      this.ttsSource = ctx.createMediaElementSource(audioEl);
+      this.ttsSource.connect(this.analyser!);
+      // Keep audio audible (analyser is a passive tap, but the element's
+      // own output path is cut once routed through Web Audio, so we must
+      // also connect to the destination).
+      this.ttsSource.connect(ctx.destination);
+    } catch {
+      // If the element was already connected elsewhere this can throw;
+      // fail silently and fall back to idle animation.
+      this.ttsSource = null;
+    }
+  }
+
+  detachTTS() {
+    try { this.ttsSource?.disconnect(); } catch {}
+    this.ttsSource = null;
+    this.ttsEl = null;
+  }
+
+  getLevels(bandCount: number): number[] {
+    if (!this.analyser) return new Array(bandCount).fill(0);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    this.analyser.getByteFrequencyData(this.data as any);
+    const bins = this.data.length;
+    const bands = new Array(bandCount).fill(0);
+    const perBand = Math.floor(bins / bandCount) || 1;
+    for (let b = 0; b < bandCount; b++) {
+      let sum = 0;
+      const start = b * perBand;
+      const end = Math.min(start + perBand, bins);
+      for (let i = start; i < end; i++) sum += this.data[i];
+      const avg = sum / Math.max(1, end - start);
+      bands[b] = avg / 255;
+    }
+    return bands;
+  }
+}
+
+let audioBus: AudioAnalyserBus | null = null;
+function getAudioBus() {
+  if (typeof window === "undefined") return null;
+  if (!audioBus) audioBus = new AudioAnalyserBus();
+  return audioBus;
 }
 
 // ─── TTS Hook ─────────────────────────────────────────────────────────────────
@@ -44,6 +140,8 @@ function useTTS() {
         unlockedRef.current = true;
       }
     } catch {}
+    // Also nudge the shared AudioContext awake on the same user gesture.
+    try { getAudioBus()?.ctx?.resume(); } catch {}
   }, []);
 
   const speak = useCallback(async (text: string) => {
@@ -68,11 +166,27 @@ function useTTS() {
       const url = URL.createObjectURL(blob);
       const audio = new Audio();
       audio.preload = "auto";
+      audio.crossOrigin = "anonymous";
       audio.setAttribute("playsinline", "true");
       audioRef.current = audio;
-      audio.onplay = () => { setIsLoading(false); setIsSpeaking(true); };
-      audio.onended = () => { setIsSpeaking(false); audioRef.current = null; setTimeout(() => URL.revokeObjectURL(url), 1000); };
-      audio.onerror = () => { setIsSpeaking(false); setIsLoading(false); audioRef.current = null; URL.revokeObjectURL(url); };
+      audio.onplay = () => {
+        setIsLoading(false);
+        setIsSpeaking(true);
+        try { getAudioBus()?.attachTTS(audio); } catch {}
+      };
+      audio.onended = () => {
+        setIsSpeaking(false);
+        audioRef.current = null;
+        try { getAudioBus()?.detachTTS(); } catch {}
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      };
+      audio.onerror = () => {
+        setIsSpeaking(false);
+        setIsLoading(false);
+        audioRef.current = null;
+        try { getAudioBus()?.detachTTS(); } catch {}
+        URL.revokeObjectURL(url);
+      };
       audio.src = url;
       await audio.play();
       unlockedRef.current = true;
@@ -85,6 +199,7 @@ function useTTS() {
 
   const stop = useCallback(() => {
     if (audioRef.current) { audioRef.current.pause(); audioRef.current.src = ""; audioRef.current = null; }
+    try { getAudioBus()?.detachTTS(); } catch {}
     setIsSpeaking(false);
     setIsLoading(false);
   }, []);
@@ -93,7 +208,13 @@ function useTTS() {
   return { speak, stop, unlock, isSpeaking, isLoading };
 }
 
-// ─── STT Hook — UPDATED for mobile ──────────────────────────────────────────
+// ─── STT Hook — manual toggle, no auto-restart ──────────────────────────────
+// Behavior: one tap starts listening and STAYS listening (continuous:true
+// where supported) until the user explicitly taps again to stop. We no
+// longer auto-restart on "no-speech" or on the engine's own onend firing —
+// that was the cause of the endless start/stop/"aborted" loop. The only
+// thing that can stop listening now is the user (stop()) or a hard error
+// that isn't a benign "no-speech"/"aborted" blip.
 type AnyRecognition = {
   continuous: boolean; interimResults: boolean; lang: string;
   onstart: (() => void) | null; onend: (() => void) | null;
@@ -110,11 +231,15 @@ function getSpeechRecognitionCtor(): (new () => AnyRecognition) | null {
 
 function useSTT(
   onResult: (text: string) => void,
-  onInterim: (text: string) => void,  // NEW: for showing partial results
-  onLog: (type: LogEntry["type"], text: string) => void // NEW: for debug log
+  onInterim: (text: string) => void,
+  onLog: (type: LogEntry["type"], text: string) => void
 ) {
   const recognitionRef = useRef<AnyRecognition | null>(null);
-  const isListeningRef = useRef(false); // track intended state separately
+  // userWantsListeningRef reflects intent: true only between an explicit
+  // start() call and an explicit stop() call (or a fatal error). The engine
+  // restarting itself is NOT allowed to flip this back to true.
+  const userWantsListeningRef = useRef(false);
+  const accumulatedFinalRef = useRef(""); // collects finals across engine restarts within one "session"
   const [isListening, setIsListening] = useState(false);
   const [supported, setSupported] = useState(true);
 
@@ -122,20 +247,18 @@ function useSTT(
     setSupported(getSpeechRecognitionCtor() !== null);
   }, []);
 
-  const createAndStart = useCallback(() => {
+  const createRecognition = useCallback(() => {
     const SR = getSpeechRecognitionCtor();
-    if (!SR) { setSupported(false); return; }
-
-    if (recognitionRef.current) {
-      try { recognitionRef.current.abort(); } catch {}
-      recognitionRef.current = null;
-    }
+    if (!SR) { setSupported(false); return null; }
 
     const rec = new SR();
-    // MOBILE FIX: continuous: false works more reliably on iOS + Android
-    rec.continuous = false;
-    // MOBILE FIX: interimResults: true lets us show partial text so user
-    // knows the mic is picking up audio before a final result fires
+    // continuous:true keeps the session open on browsers that honor it
+    // (desktop Chrome/Edge). Mobile Safari/Chrome-on-iOS frequently ignore
+    // this and end the session after a pause regardless — we handle that
+    // below by restarting ONLY while the user still wants to be listening,
+    // and we treat that restart as silent/internal, never as a new
+    // "session" the user has to re-trigger.
+    rec.continuous = true;
     rec.interimResults = true;
     rec.lang = "en-US";
 
@@ -145,91 +268,111 @@ function useSTT(
     };
 
     rec.onend = () => {
-      // MOBILE FIX: iOS Safari stops after every utterance even with
-      // continuous:true. If we're still in listening state, restart.
-      if (isListeningRef.current) {
+      // The engine ended the session on its own (common on mobile after
+      // ~60s or a pause). If the user hasn't explicitly stopped, silently
+      // restart the underlying engine so the experience still feels like
+      // one continuous listening session from the user's point of view.
+      // We do NOT log this restart and we do NOT change isListening, so
+      // there is no visible flicker and no "no-speech" spam.
+      if (userWantsListeningRef.current) {
         try {
-          const SR2 = getSpeechRecognitionCtor();
-          if (SR2) {
-            setTimeout(() => {
-              if (!isListeningRef.current) return;
-              createAndStart();
-            }, 100);
+          const fresh = createRecognition();
+          if (fresh) {
+            recognitionRef.current = fresh;
+            fresh.start();
           }
-        } catch {}
+        } catch {
+          setIsListening(false);
+          userWantsListeningRef.current = false;
+        }
       } else {
         setIsListening(false);
       }
     };
 
     rec.onerror = (e) => {
+      // "no-speech" and "aborted" are benign/expected (user paused, or we
+      // deliberately called abort() while swapping engines / stopping).
+      // Never log these as user-facing errors and never stop listening
+      // because of them — the onend handler above decides whether to
+      // restart, based solely on user intent.
+      if (e.error === "no-speech" || e.error === "aborted") return;
+
       console.error("[STT] error:", e.error);
       onLog("error", `Speech error: ${e.error}`);
-      // "no-speech" is normal — user was quiet. Don't treat as failure.
-      if (e.error === "no-speech" && isListeningRef.current) {
-        // restart silently
-        setTimeout(() => { if (isListeningRef.current) createAndStart(); }, 200);
-        return;
-      }
-      if (e.error !== "aborted") {
+      if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+        // Permission revoked mid-session — genuinely stop.
+        userWantsListeningRef.current = false;
         setIsListening(false);
-        isListeningRef.current = false;
       }
+      // Other errors: let onend decide (it will restart if user still wants
+      // to listen, since userWantsListeningRef is still true).
     };
 
     rec.onresult = (e) => {
       let interimText = "";
-      let finalText = "";
+      let newFinal = "";
       for (let i = 0; i < e.results.length; i++) {
         const result = e.results[i];
         const transcript = result[0]?.transcript ?? "";
         if (result.isFinal) {
-          finalText += transcript;
+          newFinal += transcript;
         } else {
           interimText += transcript;
         }
       }
-      // Show interim (partial) transcript in real time
-      if (interimText) onInterim(interimText);
-      // Fire final result
-      if (finalText.trim()) {
-        onInterim(""); // clear interim
-        onResult(finalText.trim());
+      if (newFinal) {
+        accumulatedFinalRef.current = (accumulatedFinalRef.current + " " + newFinal).trim();
       }
+      onInterim(interimText);
     };
 
+    return rec;
+  }, [onInterim, onLog]);
+
+  const start = useCallback(() => {
+    if (userWantsListeningRef.current) return; // already listening
+    const SR = getSpeechRecognitionCtor();
+    if (!SR) { setSupported(false); return; }
+    userWantsListeningRef.current = true;
+    accumulatedFinalRef.current = "";
+    const rec = createRecognition();
+    if (!rec) return;
     recognitionRef.current = rec;
     try {
       rec.start();
     } catch (err) {
       console.error("[STT] start failed:", err);
       onLog("error", `Could not start mic: ${err}`);
+      userWantsListeningRef.current = false;
       setIsListening(false);
-      isListeningRef.current = false;
     }
-  }, [onResult, onInterim, onLog]);
+  }, [createRecognition, onLog]);
 
-  const start = useCallback(() => {
-    isListeningRef.current = true;
-    createAndStart();
-  }, [createAndStart]);
-
+  // Explicit stop: this is the ONLY normal way listening ends. We finalize
+  // whatever transcript we have accumulated (final + any trailing interim)
+  // and hand it to onResult, mirroring "tap to talk, tap again to send."
   const stop = useCallback(() => {
-    isListeningRef.current = false;
+    userWantsListeningRef.current = false;
     try { recognitionRef.current?.stop(); } catch {}
+    try { recognitionRef.current?.abort(); } catch {}
     recognitionRef.current = null;
     setIsListening(false);
-  }, []);
+    onInterim("");
+    const finalText = accumulatedFinalRef.current.trim();
+    accumulatedFinalRef.current = "";
+    if (finalText) onResult(finalText);
+  }, [onResult, onInterim]);
 
   useEffect(() => () => {
-    isListeningRef.current = false;
+    userWantsListeningRef.current = false;
     try { recognitionRef.current?.abort(); } catch {}
   }, []);
 
   return { start, stop, isListening, supported };
 }
 
-// ─── Transcript Panel — NEW ───────────────────────────────────────────────────
+// ─── Transcript Panel ──────────────────────────────────────────────────────
 function TranscriptPanel({ log, interimText, jarvisText, color }: {
   log: LogEntry[];
   interimText: string;
@@ -254,7 +397,6 @@ function TranscriptPanel({ log, interimText, jarvisText, color }: {
       flexDirection: "column",
       gap: 8,
     }}>
-      {/* JARVIS reply — always visible */}
       <div style={{
         background: "rgba(0,0,0,0.7)",
         border: `1px solid rgba(${color},0.3)`,
@@ -269,7 +411,6 @@ function TranscriptPanel({ log, interimText, jarvisText, color }: {
         </div>
       </div>
 
-      {/* Live transcript log */}
       <div
         ref={scrollRef}
         style={{
@@ -304,7 +445,6 @@ function TranscriptPanel({ log, interimText, jarvisText, color }: {
             {entry.text}
           </div>
         ))}
-        {/* Live interim text */}
         {interimText && (
           <div style={{ fontSize: 11, color: `rgba(${color},0.5)`, fontStyle: "italic" }}>
             🎤 {interimText}…
@@ -315,13 +455,31 @@ function TranscriptPanel({ log, interimText, jarvisText, color }: {
   );
 }
 
-// ─── Audio Visualizer Canvas ──────────────────────────────────────────────────
-function AudioVisualizer({ appState }: { appState: AppState }) {
+// ─── Audio Visualizer Canvas — now reads REAL audio levels ────────────────
+// While listening: analyses the live mic stream. While speaking: analyses
+// the TTS <audio> element's own output. Otherwise: a gentle idle breathing
+// animation (no fake "fake-bass" theatrics during idle/thinking).
+function AudioVisualizer({ appState, micStream }: { appState: AppState; micStream: MediaStream | null }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animRef = useRef<number>(0);
   const barsRef = useRef<number[]>([]);
   const timeRef = useRef(0);
   const BAR_COUNT = 64;
+
+  useEffect(() => {
+    const bus = getAudioBus();
+    if (!bus) return;
+    if (appState === "listening" && micStream) {
+      bus.attachMic(micStream);
+    } else if (appState !== "speaking") {
+      // Only detach mic when we're not actively listening; TTS attach/detach
+      // is managed by useTTS itself.
+      bus.detachMic();
+    }
+    return () => {
+      if (appState === "listening") bus.detachMic();
+    };
+  }, [appState, micStream]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -344,15 +502,25 @@ function AudioVisualizer({ appState }: { appState: AppState }) {
     const cx = W / 2;
     const cy = H / 2;
     const radius = Math.min(W, H) * 0.28;
-    const isActive = appState === "speaking" || appState === "listening";
-    const isThinking = appState === "thinking";
 
     function draw() {
       timeRef.current += 0.03;
       const t = timeRef.current;
       safeCtx.clearRect(0, 0, W, H);
 
+      const isActive = appState === "speaking" || appState === "listening";
+      const isThinking = appState === "thinking";
+      const bus = getAudioBus();
+      const liveLevels = isActive && bus ? bus.getLevels(BAR_COUNT) : null;
+      const hasSignal = !!(liveLevels && liveLevels.some((v) => v > 0.02));
+
       barsRef.current = barsRef.current.map((v, i) => {
+        if (hasSignal && liveLevels) {
+          // Real audio-reactive target, mapped with a touch of gain so
+          // quiet speech still reads as visible movement.
+          const target = Math.min(1, liveLevels[i] * 1.6);
+          return v + (target - v) * 0.35;
+        }
         if (!isActive && !isThinking) {
           const target = 0.04 + 0.06 * Math.sin(t * 0.8 + i * 0.3);
           return v + (target - v) * 0.08;
@@ -361,18 +529,11 @@ function AudioVisualizer({ appState }: { appState: AppState }) {
           const target = 0.15 + 0.15 * Math.sin(t * 1.2 + i * (Math.PI * 2 / BAR_COUNT) * 3);
           return v + (target - v) * 0.06;
         }
-        const bass = i < 8 || i > BAR_COUNT - 9;
-        const mid = (i >= 8 && i <= 20) || (i >= BAR_COUNT - 21 && i <= BAR_COUNT - 9);
-        let target: number;
-        if (bass) {
-          target = 0.3 + 0.55 * Math.abs(Math.sin(t * (appState === "speaking" ? 3.2 : 2.4) + i * 0.5)) + 0.15 * Math.abs(Math.sin(t * 1.7 + i * 0.9));
-        } else if (mid) {
-          target = 0.2 + 0.35 * Math.abs(Math.sin(t * 2.1 + i * 0.4)) + 0.1 * Math.abs(Math.sin(t * 3.5 + i * 0.7));
-        } else {
-          target = 0.05 + 0.25 * Math.abs(Math.sin(t * 1.5 + i * 0.6)) + 0.05 * Math.abs(Math.sin(t * 4.1 + i));
-        }
-        if (Math.random() < 0.015 && bass) target = Math.min(target + 0.3, 1.0);
-        return v + (target - v) * 0.18;
+        // Active (listening/speaking) but no signal yet (e.g. mic just
+        // opened, or TTS buffering) — gentle idle-active shimmer instead of
+        // going fully flat, so the orb doesn't look broken.
+        const target = 0.08 + 0.06 * Math.sin(t * 1.5 + i * 0.4);
+        return v + (target - v) * 0.1;
       });
 
       for (let i = 0; i < BAR_COUNT; i++) {
@@ -723,7 +884,6 @@ function OrbCenter({ appState, color }: { appState: AppState; color: string }) {
     );
   }
 
-  // ready / speaking — simple glowing core
   return (
     <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
       <div
@@ -742,7 +902,7 @@ function OrbCenter({ appState, color }: { appState: AppState; color: string }) {
 // ─── Bottom Indicator (hint text) ────────────────────────────────────────────
 function BottomIndicator({ appState, color }: { appState: AppState; color: string }) {
   const text =
-    appState === "listening" ? "TAP TO STOP LISTENING" :
+    appState === "listening" ? "TAP TO STOP & SEND" :
     appState === "thinking" ? "TAP TO CANCEL" :
     appState === "speaking" ? "TAP TO INTERRUPT" :
     "TAP ORB TO SPEAK";
@@ -847,7 +1007,6 @@ export default function JarvisPage() {
   const [textFallbackOpen, setTextFallbackOpen] = useState(false);
   const [textInput, setTextInput] = useState("");
 
-  // NEW: transcript state
   const [transcriptLog, setTranscriptLog] = useState<LogEntry[]>([]);
   const [interimText, setInterimText] = useState("");
   const logIdRef = useRef(0);
@@ -862,6 +1021,12 @@ export default function JarvisPage() {
   const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);
   const [weather, setWeather] = useState<{ temperature: number; description: string; units: { temperature: string } } | null>(null);
 
+  // Persistent mic stream, kept alive (but not necessarily feeding the
+  // recognizer) so the visualizer can analyse it the instant listening
+  // starts, and so we don't have to re-prompt for permission every toggle.
+  const [micStream, setMicStream] = useState<MediaStream | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+
   const abortRef = useRef<AbortController | null>(null);
   const messagesRef = useRef<Message[]>([]);
   const coordsRef = useRef<{ lat: number; lon: number } | null>(null);
@@ -869,7 +1034,6 @@ export default function JarvisPage() {
   const locRef = useRef<PermissionState>("idle");
   const micRef = useRef<PermissionState>("idle");
   const camRef = useRef<PermissionState>("idle");
-  const lastPointerActionRef = useRef(0);
 
   useEffect(() => { messagesRef.current = messages; }, [messages]);
   useEffect(() => { coordsRef.current = coords; }, [coords]);
@@ -886,14 +1050,14 @@ export default function JarvisPage() {
     if (!text.trim()) return;
     stopTTS();
     setInterimText("");
-    addLog("heard", text); // Show what was heard
+    addLog("heard", text);
     setAppState("thinking");
 
     const context = [
       coordsRef.current ? `[LOCATION: GPS ${coordsRef.current.lat.toFixed(5)}, ${coordsRef.current.lon.toFixed(5)}]` : "",
       weatherRef.current ? `[WEATHER: ${weatherRef.current.description} | ${weatherRef.current.temperature}${weatherRef.current.units.temperature}]` : "",
       `[PERMISSIONS: location=${locRef.current}, microphone=${micRef.current}, camera=${camRef.current}]`,
-      "[SYSTEM: Answer confidently using sensor data above. Never claim you lack access.]",
+      "[SYSTEM: Use sensor data above when present. If a value is missing, say so rather than guessing.]",
     ].filter(Boolean).join("\n");
 
     const userMsg: Message = { role: "user", content: text };
@@ -917,7 +1081,7 @@ export default function JarvisPage() {
       if (!res.ok) throw new Error(data.error);
       const reply = data.reply as string;
       setJarvisText(reply);
-      addLog("reply", reply); // Show reply in log
+      addLog("reply", reply);
       setMessages((prev) => [...prev, { role: "assistant", content: reply }]);
       await speak(reply);
     } catch (err) {
@@ -985,7 +1149,8 @@ export default function JarvisPage() {
     setMicStatus("requesting");
     try {
       const a = await navigator.mediaDevices.getUserMedia({ audio: true });
-      a.getTracks().forEach((t) => t.stop());
+      micStreamRef.current = a;
+      setMicStream(a);
       setMicStatus("granted");
     } catch {
       setMicStatus("denied");
@@ -1001,26 +1166,34 @@ export default function JarvisPage() {
     }
   }, [unlockAudio]);
 
+  useEffect(() => () => {
+    micStreamRef.current?.getTracks().forEach((t) => t.stop());
+  }, []);
+
+  // Strict manual toggle: tap once to start listening, tap again to stop +
+  // send. Nothing here auto-starts or auto-stops on its own.
   const activateOrb = useCallback(() => {
     if (!allGranted) return;
-    if (appState === "listening") { stopSTT(); setInterimText(""); return; }
+    if (appState === "listening") {
+      stopSTT();
+      return;
+    }
     if (appState === "speaking") { stopTTS(); return; }
     if (appState === "thinking") { abortRef.current?.abort(); setAppState("ready"); return; }
     if (appState === "ready") {
       if (!sttSupported) { setTextFallbackOpen(true); return; }
-      addLog("status", "Listening…");
+      addLog("status", "Listening… tap again to stop");
       startSTT();
     }
   }, [appState, allGranted, sttSupported, startSTT, stopSTT, stopTTS, addLog]);
 
-  const handlePointerUp = useCallback((e: React.PointerEvent) => {
-    e.preventDefault();
-    lastPointerActionRef.current = Date.now();
-    activateOrb();
-  }, [activateOrb]);
-
+  // Single, simple click handler. We removed the previous pointerup+click
+  // double-handling (which existed to dedupe synthetic mobile click events)
+  // because it could occasionally swallow a legitimate second tap meant to
+  // stop listening. A plain onClick fires exactly once per tap/click across
+  // modern mobile and desktop browsers, which is what "tap to start, tap
+  // again to stop" needs.
   const handleClick = useCallback(() => {
-    if (Date.now() - lastPointerActionRef.current < 700) return;
     activateOrb();
   }, [activateOrb]);
 
@@ -1093,7 +1266,6 @@ export default function JarvisPage() {
         </div>
       )}
 
-      {/* MAIN ORB */}
       <div
         className="relative z-10 flex items-center justify-center"
         style={{
@@ -1101,11 +1273,10 @@ export default function JarvisPage() {
           height: "min(85vw, 420px)",
           maxWidth: "min(85vh, 420px)",
           maxHeight: "min(85vh, 420px)",
-          // Push orb upward to make room for the transcript panel below
           marginBottom: "min(30vw, 140px)",
         }}
       >
-        <AudioVisualizer appState={appState} />
+        <AudioVisualizer appState={appState} micStream={micStream} />
         <ArcReactorRings appState={appState} />
 
         {isActive && (
@@ -1117,10 +1288,10 @@ export default function JarvisPage() {
 
         <button
           type="button"
-          onPointerUp={handlePointerUp}
           onClick={handleClick}
           disabled={appState === "thinking"}
-          aria-label={appState === "listening" ? "Stop listening" : appState === "speaking" ? "Stop speaking" : appState === "thinking" ? "Processing" : "Start voice input"}
+          aria-label={appState === "listening" ? "Stop listening and send" : appState === "speaking" ? "Stop speaking" : appState === "thinking" ? "Processing" : "Start voice input"}
+          aria-pressed={appState === "listening"}
           className="absolute rounded-full focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 transition-all duration-700"
           style={{
             width: "36%", height: "36%", minWidth: 120, minHeight: 120,
@@ -1142,7 +1313,6 @@ export default function JarvisPage() {
         </button>
       </div>
 
-      {/* TRANSCRIPT PANEL — always visible */}
       <TranscriptPanel
         log={transcriptLog}
         interimText={interimText}

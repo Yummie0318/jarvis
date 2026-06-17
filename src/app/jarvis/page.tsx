@@ -109,8 +109,6 @@ function getAudioBus() {
 function useTTS() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const unlockedRef = useRef(false);
-  const [isSpeaking, setIsSpeaking] = useState(false);
-  const [isLoading, setIsLoading] = useState(false);
 
   const unlock = useCallback(() => {
     if (unlockedRef.current) return;
@@ -135,8 +133,6 @@ function useTTS() {
       audioRef.current.src = "";
       audioRef.current = null;
     }
-    setIsLoading(true);
-    setIsSpeaking(false);
     try {
       const res = await fetch("/api/tts", {
         method: "POST",
@@ -154,19 +150,14 @@ function useTTS() {
       audio.setAttribute("playsinline", "true");
       audioRef.current = audio;
       audio.onplay = () => {
-        setIsLoading(false);
-        setIsSpeaking(true);
         try { getAudioBus()?.attachTTS(audio); } catch {}
       };
       audio.onended = () => {
-        setIsSpeaking(false);
         audioRef.current = null;
         try { getAudioBus()?.detachTTS(); } catch {}
         setTimeout(() => URL.revokeObjectURL(url), 1000);
       };
       audio.onerror = () => {
-        setIsSpeaking(false);
-        setIsLoading(false);
         audioRef.current = null;
         try { getAudioBus()?.detachTTS(); } catch {}
         URL.revokeObjectURL(url);
@@ -176,8 +167,6 @@ function useTTS() {
       unlockedRef.current = true;
     } catch (err) {
       console.error("[TTS]", err);
-      setIsSpeaking(false);
-      setIsLoading(false);
     }
   }, []);
 
@@ -188,12 +177,10 @@ function useTTS() {
       audioRef.current = null;
     }
     try { getAudioBus()?.detachTTS(); } catch {}
-    setIsSpeaking(false);
-    setIsLoading(false);
   }, []);
 
   useEffect(() => () => { audioRef.current?.pause(); }, []);
-  return { speak, stop, unlock, isSpeaking, isLoading };
+  return { speak, stop, unlock };
 }
 
 // ─── STT Hook ──────────────────────────────────────────────────────────────
@@ -222,9 +209,6 @@ function useSTT(
   const recognitionRef = useRef<AnyRecognition | null>(null);
   const userWantsListeningRef = useRef(false);
   const accumulatedFinalRef = useRef("");
-  // Mirrors the latest interim transcript in a ref so stop() can read it
-  // synchronously — React state (interimText) is not accessible inside
-  // callbacks without stale-closure issues.
   const latestInterimRef = useRef("");
   const [isListening, setIsListening] = useState(false);
   const [supported, setSupported] = useState(true);
@@ -248,8 +232,6 @@ function useSTT(
     };
 
     rec.onend = () => {
-      // Silently restart if user still wants to listen (handles mobile
-      // engines that end sessions after silence / ~60s timeout).
       if (userWantsListeningRef.current) {
         try {
           const fresh = createRecognition();
@@ -267,7 +249,6 @@ function useSTT(
     };
 
     rec.onerror = (e) => {
-      // Benign — don't surface these to the user.
       if (e.error === "no-speech" || e.error === "aborted") return;
       console.error("[STT] error:", e.error);
       onLog("error", `Speech error: ${e.error}`);
@@ -278,20 +259,17 @@ function useSTT(
     };
 
     rec.onresult = (e) => {
-      // Start from e.resultIndex to avoid re-processing already-finalized results.
       let interimText = "";
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const result = e.results[i];
         const transcript = result[0]?.transcript ?? "";
         if (result.isFinal) {
           accumulatedFinalRef.current = (accumulatedFinalRef.current + " " + transcript).trim();
-          // Once finalized, clear the interim mirror for this chunk.
           latestInterimRef.current = "";
         } else {
           interimText += transcript;
         }
       }
-      // Always keep the ref in sync so stop() can grab it as a fallback.
       if (interimText) latestInterimRef.current = interimText;
       onInterim(interimText);
     };
@@ -319,8 +297,6 @@ function useSTT(
     }
   }, [createRecognition, onLog]);
 
-  // Explicit stop — fires onResult with whatever was heard (finals first,
-  // interim as fallback). This is the "tap to send" moment.
   const stop = useCallback(() => {
     userWantsListeningRef.current = false;
     try { recognitionRef.current?.stop(); } catch {}
@@ -330,8 +306,6 @@ function useSTT(
     onInterim("");
 
     const finals = accumulatedFinalRef.current.trim();
-    // If the engine hasn't committed a final yet (common when the user
-    // taps stop quickly), fall back to whatever interim text was last seen.
     const interim = latestInterimRef.current.trim();
     accumulatedFinalRef.current = "";
     latestInterimRef.current = "";
@@ -350,91 +324,6 @@ function useSTT(
   }, []);
 
   return { start, stop, isListening, supported };
-}
-
-// ─── Transcript Panel ──────────────────────────────────────────────────────
-function TranscriptPanel({ log, interimText, jarvisText, color }: {
-  log: LogEntry[];
-  interimText: string;
-  jarvisText: string;
-  color: string;
-}) {
-  const scrollRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [log, interimText]);
-
-  return (
-    <div style={{
-      position: "absolute",
-      bottom: "max(4.5rem, calc(env(safe-area-inset-bottom, 0px) + 4rem))",
-      left: "max(1rem, env(safe-area-inset-left, 0px))",
-      right: "max(1rem, env(safe-area-inset-right, 0px))",
-      zIndex: 20,
-      display: "flex",
-      flexDirection: "column",
-      gap: 8,
-    }}>
-      <div style={{
-        background: "rgba(0,0,0,0.7)",
-        border: `1px solid rgba(${color},0.3)`,
-        borderRadius: 6,
-        padding: "10px 14px",
-      }}>
-        <div style={{ fontSize: 8, letterSpacing: "0.25em", color: `rgba(${color},0.5)`, marginBottom: 6 }}>
-          JARVIS RESPONSE
-        </div>
-        <div style={{ fontSize: 13, color: `rgba(${color},0.9)`, lineHeight: 1.5, maxHeight: 80, overflow: "hidden", textOverflow: "ellipsis" }}>
-          {jarvisText || "—"}
-        </div>
-      </div>
-
-      <div
-        ref={scrollRef}
-        style={{
-          background: "rgba(0,0,0,0.6)",
-          border: `1px solid rgba(${color},0.15)`,
-          borderRadius: 6,
-          padding: "8px 12px",
-          maxHeight: 120,
-          overflowY: "auto",
-          display: "flex",
-          flexDirection: "column",
-          gap: 4,
-        }}
-      >
-        <div style={{ fontSize: 8, letterSpacing: "0.25em", color: `rgba(${color},0.4)`, marginBottom: 4 }}>
-          SPEECH LOG
-        </div>
-        {log.length === 0 && (
-          <div style={{ fontSize: 11, color: `rgba(${color},0.3)` }}>Tap orb to start speaking…</div>
-        )}
-        {log.map((entry) => (
-          <div key={entry.id} style={{
-            fontSize: 11,
-            color:
-              entry.type === "heard" ? `rgba(${color},0.85)` :
-              entry.type === "reply" ? `rgba(0,220,120,0.75)` :
-              entry.type === "error" ? "rgba(220,60,60,0.85)" :
-              `rgba(${color},0.4)`,
-            lineHeight: 1.4,
-          }}>
-            {entry.type === "heard" && "🎤 "}
-            {entry.type === "reply" && "🤖 "}
-            {entry.type === "error" && "⚠️ "}
-            {entry.text}
-          </div>
-        ))}
-        {interimText && (
-          <div style={{ fontSize: 11, color: `rgba(${color},0.5)`, fontStyle: "italic" }}>
-            🎤 {interimText}…
-          </div>
-        )}
-      </div>
-    </div>
-  );
 }
 
 // ─── Audio Visualizer Canvas ────────────────────────────────────────────────
@@ -501,8 +390,13 @@ function AudioVisualizer({ appState, micStream }: { appState: AppState; micStrea
           return v + (target - v) * 0.08;
         }
         if (isThinking) {
-          const target = 0.15 + 0.15 * Math.sin(t * 1.2 + i * (Math.PI * 2 / BAR_COUNT) * 3);
-          return v + (target - v) * 0.06;
+          // Enhanced thinking: ripple wave that travels around the ring
+          const angle = (i / BAR_COUNT) * Math.PI * 2;
+          const ripple1 = Math.sin(angle * 3 - t * 2.5) * 0.5 + 0.5;
+          const ripple2 = Math.sin(angle * 5 + t * 1.8) * 0.5 + 0.5;
+          const ripple3 = Math.sin(angle * 2 - t * 3.2) * 0.5 + 0.5;
+          const target = 0.08 + 0.32 * (ripple1 * 0.5 + ripple2 * 0.3 + ripple3 * 0.2);
+          return v + (target - v) * 0.12;
         }
         const target = 0.08 + 0.06 * Math.sin(t * 1.5 + i * 0.4);
         return v + (target - v) * 0.1;
@@ -511,7 +405,7 @@ function AudioVisualizer({ appState, micStream }: { appState: AppState; micStrea
       for (let i = 0; i < BAR_COUNT; i++) {
         const angle = (i / BAR_COUNT) * Math.PI * 2 - Math.PI / 2;
         const barH = barsRef.current[i];
-        const barLength = radius * 0.5 * barH + (isActive ? 4 : 2);
+        const barLength = radius * 0.5 * barH + (isActive ? 4 : isThinking ? 3 : 2);
         const innerR = radius + 2;
         const outerR = innerR + barLength;
         const x1 = cx + Math.cos(angle) * innerR;
@@ -520,9 +414,17 @@ function AudioVisualizer({ appState, micStream }: { appState: AppState; micStrea
         const y2 = cy + Math.sin(angle) * outerR;
 
         let r: number, g: number, b: number;
-        if (appState === "listening") { r = 220 + Math.floor(barH * 35); g = 60 + Math.floor(barH * 40); b = 60 + Math.floor(barH * 20); }
-        else if (appState === "thinking") { r = 140 + Math.floor(barH * 60); g = 100 + Math.floor(barH * 50); b = 240; }
-        else { r = Math.floor(barH * 80); g = 180 + Math.floor(barH * 75); b = 255; }
+        if (appState === "listening") {
+          r = 220 + Math.floor(barH * 35); g = 60 + Math.floor(barH * 40); b = 60 + Math.floor(barH * 20);
+        } else if (appState === "thinking") {
+          // Shifting purple-to-cyan hue during thinking
+          const hShift = Math.sin(timeRef.current * 0.8 + i * 0.15) * 0.5 + 0.5;
+          r = Math.floor(80 + hShift * 120 + barH * 55);
+          g = Math.floor(60 + barH * 80);
+          b = Math.floor(200 + hShift * 55);
+        } else {
+          r = Math.floor(barH * 80); g = 180 + Math.floor(barH * 75); b = 255;
+        }
 
         const alpha = 0.3 + barH * 0.7;
         safeCtx.save();
@@ -530,13 +432,13 @@ function AudioVisualizer({ appState, micStream }: { appState: AppState; micStrea
         safeCtx.lineWidth = 4;
         safeCtx.lineCap = "round";
         safeCtx.shadowColor = `rgba(${r},${g},${b},0.9)`;
-        safeCtx.shadowBlur = isActive ? 12 + barH * 18 : 4;
+        safeCtx.shadowBlur = isActive ? 12 + barH * 18 : isThinking ? 8 + barH * 14 : 4;
         safeCtx.beginPath();
         safeCtx.moveTo(x1, y1);
         safeCtx.lineTo(x2, y2);
         safeCtx.stroke();
         safeCtx.strokeStyle = `rgba(${r},${g},${b},${alpha})`;
-        safeCtx.lineWidth = isActive && barH > 0.6 ? 2.5 : 1.5;
+        safeCtx.lineWidth = (isActive && barH > 0.6) || (isThinking && barH > 0.5) ? 2.5 : 1.5;
         safeCtx.shadowBlur = 0;
         safeCtx.beginPath();
         safeCtx.moveTo(x1, y1);
@@ -545,14 +447,20 @@ function AudioVisualizer({ appState, micStream }: { appState: AppState; micStrea
         safeCtx.restore();
       }
 
-      const pulseScale = isActive ? 1 + 0.06 * Math.sin(t * 4) : 1 + 0.02 * Math.sin(t * 1.5);
+      const pulseScale = isActive
+        ? 1 + 0.06 * Math.sin(t * 4)
+        : isThinking
+        ? 1 + 0.04 * Math.sin(t * 3) + 0.02 * Math.sin(t * 7.3)
+        : 1 + 0.02 * Math.sin(t * 1.5);
       const coreR = radius * pulseScale;
       const outerGlow = safeCtx.createRadialGradient(cx, cy, coreR * 0.3, cx, cy, coreR * 1.4);
       if (appState === "listening") {
         outerGlow.addColorStop(0, `rgba(220,60,60,${0.12 + barAmplitude(barsRef.current) * 0.15})`);
         outerGlow.addColorStop(1, "rgba(0,0,0,0)");
       } else if (appState === "thinking") {
-        outerGlow.addColorStop(0, `rgba(140,100,255,${0.1 + 0.1 * Math.sin(t * 2)})`);
+        const glow = 0.1 + 0.12 * Math.sin(t * 2.1);
+        outerGlow.addColorStop(0, `rgba(120,80,255,${glow})`);
+        outerGlow.addColorStop(0.5, `rgba(0,180,255,${glow * 0.5})`);
         outerGlow.addColorStop(1, "rgba(0,0,0,0)");
       } else {
         outerGlow.addColorStop(0, `rgba(0,180,255,${0.08 + barAmplitude(barsRef.current) * 0.12})`);
@@ -562,6 +470,19 @@ function AudioVisualizer({ appState, micStream }: { appState: AppState; micStrea
       safeCtx.arc(cx, cy, coreR * 1.4, 0, Math.PI * 2);
       safeCtx.fillStyle = outerGlow;
       safeCtx.fill();
+
+      // Extra inner glow ring for thinking state
+      if (isThinking) {
+        const innerGlowR = coreR * 0.6;
+        const innerGlow = safeCtx.createRadialGradient(cx, cy, innerGlowR * 0.2, cx, cy, innerGlowR);
+        const igAlpha = 0.08 + 0.1 * Math.sin(t * 4.5);
+        innerGlow.addColorStop(0, `rgba(180,120,255,${igAlpha})`);
+        innerGlow.addColorStop(1, "rgba(0,0,0,0)");
+        safeCtx.beginPath();
+        safeCtx.arc(cx, cy, innerGlowR, 0, Math.PI * 2);
+        safeCtx.fillStyle = innerGlow;
+        safeCtx.fill();
+      }
 
       animRef.current = requestAnimationFrame(draw);
     }
@@ -584,22 +505,22 @@ function ArcReactorRings({ appState }: { appState: AppState }) {
   const alpha = appState === "ready" ? 0.08 : 0.18;
   return (
     <>
-      <div className="absolute rounded-full" style={{ width: "68%", height: "68%", border: `1px solid rgba(${color},${alpha})`, animationName: "jSpin", animationDuration: "22s", animationTimingFunction: "linear", animationIterationCount: "infinite" }}>
+      <div className="absolute rounded-full" style={{ width: "68%", height: "68%", border: `1px solid rgba(${color},${alpha})`, animationName: "jSpin", animationDuration: appState === "thinking" ? "10s" : "22s", animationTimingFunction: "linear", animationIterationCount: "infinite" }}>
         {Array.from({ length: 32 }).map((_, i) => (
           <div key={i} className="absolute" style={{ width: i % 8 === 0 ? 3 : 1.5, height: i % 8 === 0 ? 10 : 5, background: i % 8 === 0 ? `rgba(${color},0.6)` : `rgba(${color},0.2)`, top: "50%", left: "50%", transformOrigin: `1px 84px`, transform: `rotate(${i * (360 / 32)}deg) translateY(-84px)` }} />
         ))}
       </div>
-      <div className="absolute rounded-full" style={{ width: "60%", height: "60%", border: `1px solid rgba(${color},${alpha * 0.6})`, animationName: "jSpin", animationDuration: "16s", animationTimingFunction: "linear", animationIterationCount: "infinite", animationDirection: "reverse" }}>
+      <div className="absolute rounded-full" style={{ width: "60%", height: "60%", border: `1px solid rgba(${color},${alpha * 0.6})`, animationName: "jSpin", animationDuration: appState === "thinking" ? "6s" : "16s", animationTimingFunction: "linear", animationIterationCount: "infinite", animationDirection: "reverse" }}>
         {Array.from({ length: 16 }).map((_, i) => (
           <div key={i} className="absolute rounded-full" style={{ width: 3, height: 3, background: `rgba(${color},0.4)`, top: "50%", left: "50%", transformOrigin: "1.5px 74px", transform: `rotate(${i * (360 / 16)}deg) translateY(-74px)` }} />
         ))}
       </div>
-      <div className="absolute rounded-full" style={{ width: "52%", height: "52%", border: `1px solid rgba(${color},${alpha * 0.4})`, animationName: "jSpin", animationDuration: "9s", animationTimingFunction: "linear", animationIterationCount: "infinite" }}>
+      <div className="absolute rounded-full" style={{ width: "52%", height: "52%", border: `1px solid rgba(${color},${alpha * 0.4})`, animationName: "jSpin", animationDuration: appState === "thinking" ? "3.5s" : "9s", animationTimingFunction: "linear", animationIterationCount: "infinite" }}>
         {Array.from({ length: 6 }).map((_, i) => (
           <div key={i} className="absolute" style={{ width: 1, height: 14, background: `rgba(${color},0.5)`, top: "50%", left: "50%", transformOrigin: "0.5px 64px", transform: `rotate(${i * 60}deg) translateY(-64px)` }} />
         ))}
       </div>
-      <div className="absolute rounded-full" style={{ width: "44%", height: "44%", border: `1px solid rgba(${color},0.06)`, boxShadow: `0 0 ${appState === "speaking" ? 30 : 10}px rgba(${color},0.1)` }} />
+      <div className="absolute rounded-full" style={{ width: "44%", height: "44%", border: `1px solid rgba(${color},0.06)`, boxShadow: `0 0 ${appState === "speaking" ? 30 : appState === "thinking" ? 20 : 10}px rgba(${color},0.1)` }} />
     </>
   );
 }
@@ -691,10 +612,6 @@ function PermissionsScreen({ locStatus, micStatus, camStatus, onRequest }: {
 }
 
 // ─── HUD Corner Brackets ─────────────────────────────────────────────────────
-// FIX: Removed borderColor from base style. Instead, each corner's border-side
-// properties include the full value (e.g. "1px solid rgba(...)") so React
-// never sees borderColor and borderTop/Left/Right/Bottom on the same element
-// at the same time — which was causing the "conflicting shorthand" warnings.
 function HudCorners({ color }: { color: string }) {
   const borderVal = `1px solid rgba(${color},0.3)`;
   const w = "min(7vw, 36px)";
@@ -712,13 +629,9 @@ function HudCorners({ color }: { color: string }) {
 
   return (
     <div className="absolute inset-0 pointer-events-none z-10">
-      {/* Top-left */}
       <div style={{ ...base, top: insetTop, left: insetLeft, borderTop: borderVal, borderLeft: borderVal }} />
-      {/* Top-right */}
       <div style={{ ...base, top: insetTop, right: insetRight, borderTop: borderVal, borderRight: borderVal }} />
-      {/* Bottom-left */}
       <div style={{ ...base, bottom: insetBottom, left: insetLeft, borderBottom: borderVal, borderLeft: borderVal }} />
-      {/* Bottom-right */}
       <div style={{ ...base, bottom: insetBottom, right: insetRight, borderBottom: borderVal, borderRight: borderVal }} />
     </div>
   );
@@ -738,8 +651,8 @@ function StateDot({ state, color }: { state: AppState; color: string }) {
         width: 6, height: 6,
         background: `rgba(${color},0.9)`,
         boxShadow: `0 0 10px rgba(${color},0.8)`,
-        animationName: state === "ready" ? "jPulse" : "none",
-        animationDuration: "2s",
+        animationName: state === "ready" || state === "thinking" ? "jPulse" : "none",
+        animationDuration: state === "thinking" ? "0.7s" : "2s",
         animationIterationCount: "infinite",
       }} />
       <span className="text-[9px] sm:text-[10px] tracking-[0.35em]" style={{ color: `rgba(${color},0.55)` }}>
@@ -752,22 +665,21 @@ function StateDot({ state, color }: { state: AppState; color: string }) {
 // ─── Orb Center Icon/Indicator ───────────────────────────────────────────────
 function OrbCenter({ appState, color }: { appState: AppState; color: string }) {
   if (appState === "thinking") {
+    // Rotating arc/spinner instead of bouncing dots
     return (
       <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-        <div className="flex gap-1.5">
-          {[0, 1, 2].map((i) => (
-            <div key={i} className="rounded-full" style={{
-              width: 6, height: 6,
-              background: `rgba(${color},0.85)`,
-              boxShadow: `0 0 8px rgba(${color},0.6)`,
-              animationName: "jBounce",
-              animationDuration: "1.1s",
-              animationTimingFunction: "ease-in-out",
-              animationIterationCount: "infinite",
-              animationDelay: `${i * 0.15}s`,
-            }} />
-          ))}
-        </div>
+        <div style={{
+          width: "30%", height: "30%",
+          border: `2px solid rgba(${color},0.15)`,
+          borderTop: `2px solid rgba(${color},0.9)`,
+          borderRight: `2px solid rgba(${color},0.5)`,
+          borderRadius: "50%",
+          animationName: "jSpin",
+          animationDuration: "0.9s",
+          animationTimingFunction: "linear",
+          animationIterationCount: "infinite",
+          boxShadow: `0 0 12px rgba(${color},0.4)`,
+        }} />
       </div>
     );
   }
@@ -810,7 +722,7 @@ function OrbCenter({ appState, color }: { appState: AppState; color: string }) {
 function BottomIndicator({ appState, color }: { appState: AppState; color: string }) {
   const text =
     appState === "listening" ? "TAP TO STOP & SEND" :
-    appState === "thinking" ? "TAP TO CANCEL" :
+    appState === "thinking" ? "PROCESSING YOUR REQUEST" :
     appState === "speaking" ? "TAP TO INTERRUPT" :
     "TAP ORB TO SPEAK";
 
@@ -899,7 +811,7 @@ export default function JarvisPage() {
   useEffect(() => { micRef.current = micStatus; }, [micStatus]);
   useEffect(() => { camRef.current = camStatus; }, [camStatus]);
 
-  const { speak, stop: stopTTS, unlock: unlockAudio, isSpeaking, isLoading: ttsLoading } = useTTS();
+  const { speak, stop: stopTTS, unlock: unlockAudio } = useTTS();
 
   const allGranted = locStatus === "granted" && micStatus === "granted";
 
@@ -940,8 +852,6 @@ export default function JarvisPage() {
       setJarvisText(reply);
       addLog("reply", reply);
       setMessages((prev) => [...prev, { role: "assistant", content: reply }]);
-      // FIX: set appState to "speaking" BEFORE calling speak() so the orb
-      // transitions immediately, instead of briefly flashing back to "ready".
       setAppState("speaking");
       await speak(reply);
     } catch (err) {
@@ -966,10 +876,6 @@ export default function JarvisPage() {
     addLog
   );
 
-  // FIX: Simplified state sync. We only sync listening→"listening" here.
-  // The "thinking"→"speaking"→"ready" transitions are driven explicitly in
-  // handleVoiceInput above, so we don't need to watch isSpeaking/ttsLoading
-  // here and risk a race condition with the "thinking" state.
   useEffect(() => {
     if (appState === "thinking" || appState === "speaking") return;
     if (isListening) {
@@ -1039,22 +945,22 @@ export default function JarvisPage() {
 
   const activateOrb = useCallback(() => {
     if (!allGranted) return;
+    // Thinking state: orb is NOT clickable
+    if (appState === "thinking") return;
     if (appState === "listening") {
-      // User taps to stop — STT hook will fire onResult with whatever was said.
       stopSTT();
       return;
     }
     if (appState === "speaking") {
-  stopTTS();
-  if (sttSupported) {
-    addLog("status", "Listening… tap again to stop");
-    startSTT();
-  } else {
-    setAppState("ready");
-  }
-  return;
-}
-    if (appState === "thinking") { abortRef.current?.abort(); setAppState("ready"); return; }
+      stopTTS();
+      if (sttSupported) {
+        addLog("status", "Listening… tap again to stop");
+        startSTT();
+      } else {
+        setAppState("ready");
+      }
+      return;
+    }
     if (appState === "ready") {
       if (!sttSupported) { setTextFallbackOpen(true); return; }
       addLog("status", "Listening… tap again to stop");
@@ -1084,6 +990,9 @@ export default function JarvisPage() {
     appState === "speaking" ? "0,212,255" : "0,180,220";
   const isActive = appState === "speaking" || appState === "listening";
 
+  // Panels visible only during listening and speaking
+  const showPanels = appState === "listening" || appState === "speaking";
+
   return (
     <div
       className="min-h-[100dvh] bg-[#020609] flex flex-col items-center justify-center font-mono overflow-hidden relative select-none"
@@ -1103,6 +1012,7 @@ export default function JarvisPage() {
 
       <HudCorners color={stateColor} />
 
+      {/* Header */}
       <div className="absolute top-[max(1.5rem,env(safe-area-inset-top,0px))] left-0 right-0 flex flex-col items-center gap-1 z-10 px-4">
         <div className="flex items-center gap-3 sm:gap-4">
           <div className="h-px w-12 sm:w-20" style={{ background: `linear-gradient(to right, transparent, rgba(${stateColor},0.4))` }} />
@@ -1112,10 +1022,12 @@ export default function JarvisPage() {
         <span className="text-[6px] sm:text-[7px] tracking-[0.3em] sm:tracking-[0.35em] text-center" style={{ color: `rgba(${stateColor},0.2)` }}>STARK INDUSTRIES · AUTONOMOUS INTELLIGENCE</span>
       </div>
 
+      {/* State dot */}
       <div className="absolute z-10" style={{ top: "max(5.5rem, calc(env(safe-area-inset-top, 0px) + 4.5rem))" }}>
         <StateDot state={appState} color={stateColor} />
       </div>
 
+      {/* Weather */}
       {weather && (
         <div className="absolute z-10 flex flex-col items-end gap-0.5" style={{ top: "max(1.5rem, env(safe-area-inset-top, 0px))", right: "max(1rem, env(safe-area-inset-right, 0px))" }}>
           <span className="text-[11px] font-light" style={{ color: `rgba(${stateColor},0.5)` }}>
@@ -1135,13 +1047,14 @@ export default function JarvisPage() {
         </div>
       )}
 
-      {/* Orb — sized to never exceed available viewport space */}
+      {/* Orb */}
       <div
         className="relative z-10 flex items-center justify-center"
         style={{
           width: "min(85vw, 85vh, 420px)",
           height: "min(85vw, 85vh, 420px)",
-          marginBottom: "min(25vw, 25vh, 140px)",
+          marginBottom: showPanels ? "min(25vw, 25vh, 140px)" : "0",
+          transition: "margin-bottom 0.4s ease",
         }}
       >
         <AudioVisualizer appState={appState} micStream={micStream} />
@@ -1154,9 +1067,19 @@ export default function JarvisPage() {
           </>
         )}
 
+        {/* Thinking pulse rings */}
+        {appState === "thinking" && (
+          <>
+            <div className="absolute rounded-full" style={{ width: "76%", height: "76%", border: `1px solid rgba(${stateColor},0.2)`, animationName: "jPing", animationDuration: "1.6s", animationTimingFunction: "ease-out", animationIterationCount: "infinite" }} />
+            <div className="absolute rounded-full" style={{ width: "76%", height: "76%", border: `1px solid rgba(${stateColor},0.12)`, animationName: "jPing", animationDuration: "1.6s", animationTimingFunction: "ease-out", animationIterationCount: "infinite", animationDelay: "0.5s" }} />
+            <div className="absolute rounded-full" style={{ width: "76%", height: "76%", border: `1px solid rgba(${stateColor},0.06)`, animationName: "jPing", animationDuration: "1.6s", animationTimingFunction: "ease-out", animationIterationCount: "infinite", animationDelay: "1s" }} />
+          </>
+        )}
+
         <button
           type="button"
           onClick={handleClick}
+          // Disabled AND non-interactive during thinking
           disabled={appState === "thinking"}
           aria-label={
             appState === "listening" ? "Stop listening and send" :
@@ -1167,8 +1090,6 @@ export default function JarvisPage() {
           aria-pressed={appState === "listening"}
           className="absolute rounded-full focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 transition-all duration-700"
           style={{
-            // FIX: use percentage sizing only — no fixed minWidth/minHeight
-            // that could overflow small phone screens.
             width: "36%",
             height: "36%",
             outlineColor: `rgba(${stateColor},0.6)`,
@@ -1179,13 +1100,15 @@ export default function JarvisPage() {
               appState === "thinking" ? "radial-gradient(circle at 38% 35%, rgba(180,140,255,0.22) 0%, rgba(80,40,180,0.12) 45%, rgba(5,2,18,0.94) 100%)" :
               appState === "speaking" ? "radial-gradient(circle at 38% 35%, rgba(80,230,255,0.25) 0%, rgba(0,130,200,0.15) 45%, rgba(1,10,20,0.94) 100%)" :
               "radial-gradient(circle at 38% 35%, rgba(20,130,180,0.1) 0%, rgba(0,50,80,0.06) 45%, rgba(2,8,16,0.95) 100%)",
-            border: `1px solid rgba(${stateColor},${isActive ? 0.55 : 0.18})`,
+            border: `1px solid rgba(${stateColor},${isActive ? 0.55 : appState === "thinking" ? 0.4 : 0.18})`,
             boxShadow: isActive
               ? `0 0 80px rgba(${stateColor},0.35), 0 0 30px rgba(${stateColor},0.18) inset, 0 0 120px rgba(${stateColor},0.12)`
               : appState === "thinking"
-              ? `0 0 40px rgba(${stateColor},0.2), 0 0 12px rgba(${stateColor},0.08) inset`
+              ? `0 0 60px rgba(${stateColor},0.3), 0 0 20px rgba(${stateColor},0.12) inset, 0 0 90px rgba(${stateColor},0.08)`
               : `0 0 18px rgba(${stateColor},0.08)`,
             cursor: appState === "thinking" ? "not-allowed" : "pointer",
+            // Slightly dim the orb during thinking to reinforce non-interactivity
+            opacity: appState === "thinking" ? 0.85 : 1,
           }}
         >
           <div className="absolute rounded-full pointer-events-none" style={{ width: "32%", height: "18%", top: "16%", left: "19%", background: "radial-gradient(ellipse, rgba(255,255,255,0.09) 0%, transparent 100%)", transform: "rotate(-22deg)" }} />
@@ -1193,13 +1116,81 @@ export default function JarvisPage() {
         </button>
       </div>
 
-      <TranscriptPanel
-        log={transcriptLog}
-        interimText={interimText}
-        jarvisText={jarvisText}
-        color={stateColor}
-      />
+      {/* Transcript panels — only shown during listening and speaking */}
+      <div style={{
+        position: "absolute",
+        bottom: "max(4.5rem, calc(env(safe-area-inset-bottom, 0px) + 4rem))",
+        left: "max(1rem, env(safe-area-inset-left, 0px))",
+        right: "max(1rem, env(safe-area-inset-right, 0px))",
+        zIndex: 20,
+        display: "flex",
+        flexDirection: "column",
+        gap: 8,
+        opacity: showPanels ? 1 : 0,
+        transform: showPanels ? "translateY(0)" : "translateY(12px)",
+        transition: "opacity 0.35s ease, transform 0.35s ease",
+        pointerEvents: showPanels ? "auto" : "none",
+      }}>
+        {/* JARVIS response */}
+        <div style={{
+          background: "rgba(0,0,0,0.7)",
+          border: `1px solid rgba(${stateColor},0.3)`,
+          borderRadius: 6,
+          padding: "10px 14px",
+        }}>
+          <div style={{ fontSize: 8, letterSpacing: "0.25em", color: `rgba(${stateColor},0.5)`, marginBottom: 6 }}>
+            JARVIS RESPONSE
+          </div>
+          <div style={{ fontSize: 13, color: `rgba(${stateColor},0.9)`, lineHeight: 1.5, maxHeight: 80, overflow: "hidden", textOverflow: "ellipsis" }}>
+            {jarvisText || "—"}
+          </div>
+        </div>
 
+        {/* Speech log — only during listening */}
+        {appState === "listening" && (
+          <div style={{
+            background: "rgba(0,0,0,0.6)",
+            border: `1px solid rgba(${stateColor},0.15)`,
+            borderRadius: 6,
+            padding: "8px 12px",
+            maxHeight: 100,
+            overflowY: "auto",
+            display: "flex",
+            flexDirection: "column",
+            gap: 4,
+          }}>
+            <div style={{ fontSize: 8, letterSpacing: "0.25em", color: `rgba(${stateColor},0.4)`, marginBottom: 4 }}>
+              SPEECH LOG
+            </div>
+            {transcriptLog.length === 0 && (
+              <div style={{ fontSize: 11, color: `rgba(${stateColor},0.3)` }}>Speak now…</div>
+            )}
+            {transcriptLog.slice(-5).map((entry) => (
+              <div key={entry.id} style={{
+                fontSize: 11,
+                color:
+                  entry.type === "heard" ? `rgba(${stateColor},0.85)` :
+                  entry.type === "reply" ? `rgba(0,220,120,0.75)` :
+                  entry.type === "error" ? "rgba(220,60,60,0.85)" :
+                  `rgba(${stateColor},0.4)`,
+                lineHeight: 1.4,
+              }}>
+                {entry.type === "heard" && "🎤 "}
+                {entry.type === "reply" && "🤖 "}
+                {entry.type === "error" && "⚠️ "}
+                {entry.text}
+              </div>
+            ))}
+            {interimText && (
+              <div style={{ fontSize: 11, color: `rgba(${stateColor},0.5)`, fontStyle: "italic" }}>
+                🎤 {interimText}…
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Bottom indicator */}
       <div className="absolute z-10 flex justify-center px-4" style={{ bottom: "max(0.5rem, calc(env(safe-area-inset-bottom, 0px) + 0.25rem))" }}>
         <BottomIndicator appState={appState} color={stateColor} />
       </div>

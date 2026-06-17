@@ -2,8 +2,6 @@
 
 import { useState, useRef, useEffect, useCallback } from "react";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
 type PermissionState = "idle" | "requesting" | "granted" | "denied" | "error" | "unsupported";
 type AppState = "permissions" | "ready" | "listening" | "thinking" | "speaking";
 interface Message {
@@ -11,49 +9,41 @@ interface Message {
   content: string;
 }
 
-// ─── Platform detection ───────────────────────────────────────────────────────
-// iOS Safari/Chrome/Firefox all use WebKit under the hood and share its quirks
-// (no SpeechRecognition on iOS Chrome/Firefox, strict audio-gesture rules).
+// ─── NEW: Transcript log entry for debug panel ─────────────────────────────
+interface LogEntry {
+  id: number;
+  type: "interim" | "heard" | "reply" | "error" | "status";
+  text: string;
+}
 
 function isIOS() {
   if (typeof navigator === "undefined") return false;
   const ua = navigator.userAgent;
   const iOSDevice = /iPad|iPhone|iPod/.test(ua);
-  // iPadOS 13+ reports as "Mac" with touch support — detect that case too.
   const iPadOS13Up = navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
   return iOSDevice || iPadOS13Up;
 }
 
 // ─── TTS Hook ─────────────────────────────────────────────────────────────────
-// iOS Safari/Chrome require every audio.play() call to be triggered by, or
-// directly inside the call stack of, a user gesture the FIRST time — after
-// one successful unlocked play() the element can usually be reused freely.
-
 function useTTS() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const unlockedRef = useRef(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
 
-  // Call this synchronously inside a click/touchend handler to "unlock" audio
-  // playback on iOS before any async work happens. Plays a near-silent blip.
   const unlock = useCallback(() => {
     if (unlockedRef.current) return;
     try {
       const a = new Audio();
-      // Tiny silent WAV — valid audio, effectively inaudible, very short.
-      a.src =
-        "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+      a.src = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
       a.volume = 0;
       const p = a.play();
       if (p && typeof p.then === "function") {
-        p.then(() => { unlockedRef.current = true; }).catch(() => { /* will retry unlock next gesture */ });
+        p.then(() => { unlockedRef.current = true; }).catch(() => {});
       } else {
         unlockedRef.current = true;
       }
-    } catch {
-      // Ignore — speak() will still try and may simply fail silently on first attempt.
-    }
+    } catch {}
   }, []);
 
   const speak = useCallback(async (text: string) => {
@@ -78,8 +68,6 @@ function useTTS() {
       const url = URL.createObjectURL(blob);
       const audio = new Audio();
       audio.preload = "auto";
-      // playsInline-equivalent for <audio> isn't needed, but setting these
-      // helps some in-app/Android WebViews route playback correctly.
       audio.setAttribute("playsinline", "true");
       audioRef.current = audio;
       audio.onplay = () => { setIsLoading(false); setIsSpeaking(true); };
@@ -89,8 +77,6 @@ function useTTS() {
       await audio.play();
       unlockedRef.current = true;
     } catch (err) {
-      // Most common mobile failure mode: NotAllowedError because this call
-      // wasn't inside a user gesture (e.g. it was fired from a setTimeout).
       console.error("[TTS]", err);
       setIsSpeaking(false);
       setIsLoading(false);
@@ -107,16 +93,12 @@ function useTTS() {
   return { speak, stop, unlock, isSpeaking, isLoading };
 }
 
-// ─── STT Hook ─────────────────────────────────────────────────────────────────
-// SpeechRecognition is unavailable on iOS Chrome/Firefox and any Firefox
-// without the flag enabled. We feature-detect once and expose `supported`
-// so the UI can offer a typed-text fallback instead of a dead button.
-
+// ─── STT Hook — UPDATED for mobile ──────────────────────────────────────────
 type AnyRecognition = {
   continuous: boolean; interimResults: boolean; lang: string;
   onstart: (() => void) | null; onend: (() => void) | null;
   onerror: ((e: { error: string }) => void) | null;
-  onresult: ((e: { results: { [k: number]: { [k: number]: { transcript: string } } } }) => void) | null;
+  onresult: ((e: { results: { [k: number]: { [k: number]: { transcript: string }; isFinal: boolean }; length: number } }) => void) | null;
   start: () => void; stop: () => void; abort: () => void;
 };
 
@@ -126,8 +108,13 @@ function getSpeechRecognitionCtor(): (new () => AnyRecognition) | null {
   return w["SpeechRecognition"] || w["webkitSpeechRecognition"] || null;
 }
 
-function useSTT(onResult: (text: string) => void) {
+function useSTT(
+  onResult: (text: string) => void,
+  onInterim: (text: string) => void,  // NEW: for showing partial results
+  onLog: (type: LogEntry["type"], text: string) => void // NEW: for debug log
+) {
   const recognitionRef = useRef<AnyRecognition | null>(null);
+  const isListeningRef = useRef(false); // track intended state separately
   const [isListening, setIsListening] = useState(false);
   const [supported, setSupported] = useState(true);
 
@@ -135,61 +122,205 @@ function useSTT(onResult: (text: string) => void) {
     setSupported(getSpeechRecognitionCtor() !== null);
   }, []);
 
-  const start = useCallback(() => {
+  const createAndStart = useCallback(() => {
     const SR = getSpeechRecognitionCtor();
-    if (!SR) {
-      setSupported(false);
-      return;
-    }
+    if (!SR) { setSupported(false); return; }
+
     if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch { /* noop */ }
+      try { recognitionRef.current.abort(); } catch {}
       recognitionRef.current = null;
     }
+
     const rec = new SR();
+    // MOBILE FIX: continuous: false works more reliably on iOS + Android
     rec.continuous = false;
-    rec.interimResults = false;
+    // MOBILE FIX: interimResults: true lets us show partial text so user
+    // knows the mic is picking up audio before a final result fires
+    rec.interimResults = true;
     rec.lang = "en-US";
-    rec.onstart = () => setIsListening(true);
-    rec.onend = () => setIsListening(false);
+
+    rec.onstart = () => {
+      setIsListening(true);
+      onLog("status", "Mic started — speak now");
+    };
+
+    rec.onend = () => {
+      // MOBILE FIX: iOS Safari stops after every utterance even with
+      // continuous:true. If we're still in listening state, restart.
+      if (isListeningRef.current) {
+        try {
+          const SR2 = getSpeechRecognitionCtor();
+          if (SR2) {
+            setTimeout(() => {
+              if (!isListeningRef.current) return;
+              createAndStart();
+            }, 100);
+          }
+        } catch {}
+      } else {
+        setIsListening(false);
+      }
+    };
+
     rec.onerror = (e) => {
       console.error("[STT] error:", e.error);
-      setIsListening(false);
+      onLog("error", `Speech error: ${e.error}`);
+      // "no-speech" is normal — user was quiet. Don't treat as failure.
+      if (e.error === "no-speech" && isListeningRef.current) {
+        // restart silently
+        setTimeout(() => { if (isListeningRef.current) createAndStart(); }, 200);
+        return;
+      }
+      if (e.error !== "aborted") {
+        setIsListening(false);
+        isListeningRef.current = false;
+      }
     };
+
     rec.onresult = (e) => {
-      const t = e.results[0]?.[0]?.transcript ?? "";
-      if (t.trim()) onResult(t.trim());
+      let interimText = "";
+      let finalText = "";
+      for (let i = 0; i < e.results.length; i++) {
+        const result = e.results[i];
+        const transcript = result[0]?.transcript ?? "";
+        if (result.isFinal) {
+          finalText += transcript;
+        } else {
+          interimText += transcript;
+        }
+      }
+      // Show interim (partial) transcript in real time
+      if (interimText) onInterim(interimText);
+      // Fire final result
+      if (finalText.trim()) {
+        onInterim(""); // clear interim
+        onResult(finalText.trim());
+      }
     };
+
     recognitionRef.current = rec;
     try {
       rec.start();
     } catch (err) {
       console.error("[STT] start failed:", err);
+      onLog("error", `Could not start mic: ${err}`);
       setIsListening(false);
+      isListeningRef.current = false;
     }
-  }, [onResult]);
+  }, [onResult, onInterim, onLog]);
+
+  const start = useCallback(() => {
+    isListeningRef.current = true;
+    createAndStart();
+  }, [createAndStart]);
 
   const stop = useCallback(() => {
-    try { recognitionRef.current?.stop(); } catch { /* noop */ }
+    isListeningRef.current = false;
+    try { recognitionRef.current?.stop(); } catch {}
+    recognitionRef.current = null;
     setIsListening(false);
   }, []);
 
   useEffect(() => () => {
-    try { recognitionRef.current?.abort(); } catch { /* noop */ }
+    isListeningRef.current = false;
+    try { recognitionRef.current?.abort(); } catch {}
   }, []);
 
   return { start, stop, isListening, supported };
 }
 
-// ─── Audio Visualizer Canvas ─────────────────────────────────────────────────
-// Uses devicePixelRatio-aware sizing so it renders crisply on high-DPI phone
-// screens instead of the fixed 500x500 buffer being stretched/blurred by CSS.
+// ─── Transcript Panel — NEW ───────────────────────────────────────────────────
+function TranscriptPanel({ log, interimText, jarvisText, color }: {
+  log: LogEntry[];
+  interimText: string;
+  jarvisText: string;
+  color: string;
+}) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [log, interimText]);
 
+  return (
+    <div style={{
+      position: "absolute",
+      bottom: "max(4.5rem, calc(env(safe-area-inset-bottom) + 4rem))",
+      left: "max(1rem, env(safe-area-inset-left))",
+      right: "max(1rem, env(safe-area-inset-right))",
+      zIndex: 20,
+      display: "flex",
+      flexDirection: "column",
+      gap: 8,
+    }}>
+      {/* JARVIS reply — always visible */}
+      <div style={{
+        background: "rgba(0,0,0,0.7)",
+        border: `1px solid rgba(${color},0.3)`,
+        borderRadius: 6,
+        padding: "10px 14px",
+      }}>
+        <div style={{ fontSize: 8, letterSpacing: "0.25em", color: `rgba(${color},0.5)`, marginBottom: 6 }}>
+          JARVIS RESPONSE
+        </div>
+        <div style={{ fontSize: 13, color: `rgba(${color},0.9)`, lineHeight: 1.5, maxHeight: 80, overflow: "hidden", textOverflow: "ellipsis" }}>
+          {jarvisText || "—"}
+        </div>
+      </div>
+
+      {/* Live transcript log */}
+      <div
+        ref={scrollRef}
+        style={{
+          background: "rgba(0,0,0,0.6)",
+          border: `1px solid rgba(${color},0.15)`,
+          borderRadius: 6,
+          padding: "8px 12px",
+          maxHeight: 120,
+          overflowY: "auto",
+          display: "flex",
+          flexDirection: "column",
+          gap: 4,
+        }}
+      >
+        <div style={{ fontSize: 8, letterSpacing: "0.25em", color: `rgba(${color},0.4)`, marginBottom: 4 }}>
+          SPEECH LOG
+        </div>
+        {log.length === 0 && (
+          <div style={{ fontSize: 11, color: `rgba(${color},0.3)` }}>Tap orb to start speaking…</div>
+        )}
+        {log.map((entry) => (
+          <div key={entry.id} style={{ fontSize: 11, color:
+            entry.type === "heard" ? `rgba(${color},0.85)` :
+            entry.type === "reply" ? `rgba(0,220,120,0.75)` :
+            entry.type === "error" ? "rgba(220,60,60,0.85)" :
+            `rgba(${color},0.4)`,
+            lineHeight: 1.4,
+          }}>
+            {entry.type === "heard" && "🎤 "}
+            {entry.type === "reply" && "🤖 "}
+            {entry.type === "error" && "⚠️ "}
+            {entry.text}
+          </div>
+        ))}
+        {/* Live interim text */}
+        {interimText && (
+          <div style={{ fontSize: 11, color: `rgba(${color},0.5)`, fontStyle: "italic" }}>
+            🎤 {interimText}…
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Audio Visualizer Canvas ──────────────────────────────────────────────────
 function AudioVisualizer({ appState }: { appState: AppState }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animRef = useRef<number>(0);
   const barsRef = useRef<number[]>([]);
   const timeRef = useRef(0);
-
   const BAR_COUNT = 64;
 
   useEffect(() => {
@@ -197,8 +328,7 @@ function AudioVisualizer({ appState }: { appState: AppState }) {
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    const safeCtx = ctx; // capture for closure — TypeScript loses narrowing in nested fns
-
+    const safeCtx = ctx;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const cssSize = canvas.clientWidth || 500;
     canvas.width = cssSize * dpr;
@@ -214,14 +344,12 @@ function AudioVisualizer({ appState }: { appState: AppState }) {
     const cx = W / 2;
     const cy = H / 2;
     const radius = Math.min(W, H) * 0.28;
-
     const isActive = appState === "speaking" || appState === "listening";
     const isThinking = appState === "thinking";
 
     function draw() {
       timeRef.current += 0.03;
       const t = timeRef.current;
-
       safeCtx.clearRect(0, 0, W, H);
 
       barsRef.current = barsRef.current.map((v, i) => {
@@ -237,14 +365,11 @@ function AudioVisualizer({ appState }: { appState: AppState }) {
         const mid = (i >= 8 && i <= 20) || (i >= BAR_COUNT - 21 && i <= BAR_COUNT - 9);
         let target: number;
         if (bass) {
-          target = 0.3 + 0.55 * Math.abs(Math.sin(t * (appState === "speaking" ? 3.2 : 2.4) + i * 0.5))
-            + 0.15 * Math.abs(Math.sin(t * 1.7 + i * 0.9));
+          target = 0.3 + 0.55 * Math.abs(Math.sin(t * (appState === "speaking" ? 3.2 : 2.4) + i * 0.5)) + 0.15 * Math.abs(Math.sin(t * 1.7 + i * 0.9));
         } else if (mid) {
-          target = 0.2 + 0.35 * Math.abs(Math.sin(t * 2.1 + i * 0.4))
-            + 0.1 * Math.abs(Math.sin(t * 3.5 + i * 0.7));
+          target = 0.2 + 0.35 * Math.abs(Math.sin(t * 2.1 + i * 0.4)) + 0.1 * Math.abs(Math.sin(t * 3.5 + i * 0.7));
         } else {
-          target = 0.05 + 0.25 * Math.abs(Math.sin(t * 1.5 + i * 0.6))
-            + 0.05 * Math.abs(Math.sin(t * 4.1 + i));
+          target = 0.05 + 0.25 * Math.abs(Math.sin(t * 1.5 + i * 0.6)) + 0.05 * Math.abs(Math.sin(t * 4.1 + i));
         }
         if (Math.random() < 0.015 && bass) target = Math.min(target + 0.3, 1.0);
         return v + (target - v) * 0.18;
@@ -256,29 +381,17 @@ function AudioVisualizer({ appState }: { appState: AppState }) {
         const barLength = radius * 0.5 * barH + (isActive ? 4 : 2);
         const innerR = radius + 2;
         const outerR = innerR + barLength;
-
         const x1 = cx + Math.cos(angle) * innerR;
         const y1 = cy + Math.sin(angle) * innerR;
         const x2 = cx + Math.cos(angle) * outerR;
         const y2 = cy + Math.sin(angle) * outerR;
 
         let r: number, g: number, b: number;
-        if (appState === "listening") {
-          r = 220 + Math.floor(barH * 35);
-          g = 60 + Math.floor(barH * 40);
-          b = 60 + Math.floor(barH * 20);
-        } else if (appState === "thinking") {
-          r = 140 + Math.floor(barH * 60);
-          g = 100 + Math.floor(barH * 50);
-          b = 240;
-        } else {
-          r = Math.floor(barH * 80);
-          g = 180 + Math.floor(barH * 75);
-          b = 255;
-        }
+        if (appState === "listening") { r = 220 + Math.floor(barH * 35); g = 60 + Math.floor(barH * 40); b = 60 + Math.floor(barH * 20); }
+        else if (appState === "thinking") { r = 140 + Math.floor(barH * 60); g = 100 + Math.floor(barH * 50); b = 240; }
+        else { r = Math.floor(barH * 80); g = 180 + Math.floor(barH * 75); b = 255; }
 
         const alpha = 0.3 + barH * 0.7;
-
         safeCtx.save();
         safeCtx.strokeStyle = `rgba(${r},${g},${b},${alpha * 0.35})`;
         safeCtx.lineWidth = 4;
@@ -289,7 +402,6 @@ function AudioVisualizer({ appState }: { appState: AppState }) {
         safeCtx.moveTo(x1, y1);
         safeCtx.lineTo(x2, y2);
         safeCtx.stroke();
-
         safeCtx.strokeStyle = `rgba(${r},${g},${b},${alpha})`;
         safeCtx.lineWidth = isActive && barH > 0.6 ? 2.5 : 1.5;
         safeCtx.shadowBlur = 0;
@@ -302,7 +414,6 @@ function AudioVisualizer({ appState }: { appState: AppState }) {
 
       const pulseScale = isActive ? 1 + 0.06 * Math.sin(t * 4) : 1 + 0.02 * Math.sin(t * 1.5);
       const coreR = radius * pulseScale;
-
       const outerGlow = safeCtx.createRadialGradient(cx, cy, coreR * 0.3, cx, cy, coreR * 1.4);
       if (appState === "listening") {
         outerGlow.addColorStop(0, `rgba(220,60,60,${0.12 + barAmplitude(barsRef.current) * 0.15})`);
@@ -326,13 +437,7 @@ function AudioVisualizer({ appState }: { appState: AppState }) {
     return () => cancelAnimationFrame(animRef.current);
   }, [appState]);
 
-  return (
-    <canvas
-      ref={canvasRef}
-      className="absolute inset-0 w-full h-full"
-      style={{ pointerEvents: "none" }}
-    />
-  );
+  return <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" style={{ pointerEvents: "none" }} />;
 }
 
 function barAmplitude(bars: number[]) {
@@ -341,85 +446,400 @@ function barAmplitude(bars: number[]) {
 }
 
 // ─── Arc Reactor Rings ────────────────────────────────────────────────────────
-
 function ArcReactorRings({ appState }: { appState: AppState }) {
   const color = appState === "listening" ? "220,60,60" : appState === "thinking" ? "140,100,255" : "0,212,255";
   const alpha = appState === "ready" ? 0.08 : 0.18;
-
   return (
     <>
-      <div className="absolute rounded-full" style={{
-        width: "68%", height: "68%",
-        border: `1px solid rgba(${color},${alpha})`,
-        animationName: "jSpin",
-        animationDuration: "22s",
-        animationTimingFunction: "linear",
-        animationIterationCount: "infinite",
-        animationDirection: "normal",
-      }}>
+      <div className="absolute rounded-full" style={{ width: "68%", height: "68%", border: `1px solid rgba(${color},${alpha})`, animationName: "jSpin", animationDuration: "22s", animationTimingFunction: "linear", animationIterationCount: "infinite" }}>
         {Array.from({ length: 32 }).map((_, i) => (
-          <div key={i} className="absolute" style={{
-            width: i % 8 === 0 ? 3 : 1.5,
-            height: i % 8 === 0 ? 10 : 5,
-            background: i % 8 === 0 ? `rgba(${color},0.6)` : `rgba(${color},0.2)`,
-            top: "50%", left: "50%",
-            transformOrigin: `1px 84px`,
-            transform: `rotate(${i * (360 / 32)}deg) translateY(-84px)`,
-          }} />
+          <div key={i} className="absolute" style={{ width: i % 8 === 0 ? 3 : 1.5, height: i % 8 === 0 ? 10 : 5, background: i % 8 === 0 ? `rgba(${color},0.6)` : `rgba(${color},0.2)`, top: "50%", left: "50%", transformOrigin: `1px 84px`, transform: `rotate(${i * (360 / 32)}deg) translateY(-84px)` }} />
         ))}
       </div>
-
-      <div className="absolute rounded-full" style={{
-        width: "60%", height: "60%",
-        border: `1px solid rgba(${color},${alpha * 0.6})`,
-        animationName: "jSpin",
-        animationDuration: "16s",
-        animationTimingFunction: "linear",
-        animationIterationCount: "infinite",
-        animationDirection: "reverse",
-      }}>
+      <div className="absolute rounded-full" style={{ width: "60%", height: "60%", border: `1px solid rgba(${color},${alpha * 0.6})`, animationName: "jSpin", animationDuration: "16s", animationTimingFunction: "linear", animationIterationCount: "infinite", animationDirection: "reverse" }}>
         {Array.from({ length: 16 }).map((_, i) => (
-          <div key={i} className="absolute rounded-full" style={{
-            width: 3, height: 3,
-            background: `rgba(${color},0.4)`,
-            top: "50%", left: "50%",
-            transformOrigin: "1.5px 74px",
-            transform: `rotate(${i * (360 / 16)}deg) translateY(-74px)`,
-          }} />
+          <div key={i} className="absolute rounded-full" style={{ width: 3, height: 3, background: `rgba(${color},0.4)`, top: "50%", left: "50%", transformOrigin: "1.5px 74px", transform: `rotate(${i * (360 / 16)}deg) translateY(-74px)` }} />
         ))}
       </div>
-
-      <div className="absolute rounded-full" style={{
-        width: "52%", height: "52%",
-        border: `1px solid rgba(${color},${alpha * 0.4})`,
-        animationName: "jSpin",
-        animationDuration: "9s",
-        animationTimingFunction: "linear",
-        animationIterationCount: "infinite",
-        animationDirection: "normal",
-      }}>
+      <div className="absolute rounded-full" style={{ width: "52%", height: "52%", border: `1px solid rgba(${color},${alpha * 0.4})`, animationName: "jSpin", animationDuration: "9s", animationTimingFunction: "linear", animationIterationCount: "infinite" }}>
         {Array.from({ length: 6 }).map((_, i) => (
-          <div key={i} className="absolute" style={{
-            width: 1, height: 14,
-            background: `rgba(${color},0.5)`,
-            top: "50%", left: "50%",
-            transformOrigin: "0.5px 64px",
-            transform: `rotate(${i * 60}deg) translateY(-64px)`,
-          }} />
+          <div key={i} className="absolute" style={{ width: 1, height: 14, background: `rgba(${color},0.5)`, top: "50%", left: "50%", transformOrigin: "0.5px 64px", transform: `rotate(${i * 60}deg) translateY(-64px)` }} />
         ))}
       </div>
-
-      <div className="absolute rounded-full" style={{
-        width: "44%", height: "44%",
-        border: `1px solid rgba(${color},0.06)`,
-        boxShadow: `0 0 ${appState === "speaking" ? 30 : 10}px rgba(${color},0.1)`,
-      }} />
+      <div className="absolute rounded-full" style={{ width: "44%", height: "44%", border: `1px solid rgba(${color},0.06)`, boxShadow: `0 0 ${appState === "speaking" ? 30 : 10}px rgba(${color},0.1)` }} />
     </>
   );
 }
 
-// ─── Main Component ───────────────────────────────────────────────────────────
+// ─── Permissions Screen ─────────────────────────────────────────────────────
+function PermissionRow({
+  label,
+  status,
+  color,
+}: {
+  label: string;
+  status: PermissionState;
+  color: string;
+}) {
+  const statusText =
+    status === "idle" ? "PENDING" :
+    status === "requesting" ? "REQUESTING…" :
+    status === "granted" ? "GRANTED" :
+    status === "denied" ? "DENIED" :
+    status === "unsupported" ? "UNSUPPORTED" : "ERROR";
 
+  const statusColor =
+    status === "granted" ? "0,220,120" :
+    status === "denied" || status === "error" ? "220,60,60" :
+    status === "requesting" ? "230,180,40" :
+    "120,120,120";
+
+  return (
+    <div className="flex items-center justify-between gap-4 w-full">
+      <span className="text-[10px] sm:text-[11px] tracking-[0.25em]" style={{ color: `rgba(${color},0.65)` }}>
+        {label}
+      </span>
+      <div className="flex items-center gap-2">
+        <div
+          className="rounded-full"
+          style={{
+            width: 6,
+            height: 6,
+            background: `rgba(${statusColor},0.9)`,
+            boxShadow: `0 0 8px rgba(${statusColor},0.7)`,
+            animationName: status === "requesting" ? "jPulse" : "none",
+            animationDuration: "1s",
+            animationIterationCount: "infinite",
+          }}
+        />
+        <span className="text-[9px] sm:text-[10px] tracking-[0.2em]" style={{ color: `rgba(${statusColor},0.85)` }}>
+          {statusText}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function PermissionsScreen({
+  locStatus,
+  micStatus,
+  camStatus,
+  onRequest,
+}: {
+  locStatus: PermissionState;
+  micStatus: PermissionState;
+  camStatus: PermissionState;
+  onRequest: () => void;
+}) {
+  const color = "0,212,255";
+  const anyRequesting = locStatus === "requesting" || micStatus === "requesting" || camStatus === "requesting";
+  const anyDenied = locStatus === "denied" || micStatus === "denied";
+  const buttonLabel = anyRequesting ? "REQUESTING ACCESS…" : anyDenied ? "RETRY AUTHORIZATION" : "INITIALIZE SYSTEMS";
+
+  return (
+    <div
+      className="min-h-[100dvh] bg-[#020609] flex flex-col items-center justify-center font-mono overflow-hidden relative select-none px-6"
+      style={{ touchAction: "manipulation" }}
+    >
+      <div className="absolute inset-0" style={{
+        background: `radial-gradient(ellipse at 50% 50%, rgba(${color},0.05) 0%, #020609 55%, #010305 100%)`,
+      }} />
+      <div className="absolute inset-0 opacity-[0.025]" style={{
+        backgroundImage: "linear-gradient(#00d4ff 1px,transparent 1px),linear-gradient(90deg,#00d4ff 1px,transparent 1px)",
+        backgroundSize: "80px 80px",
+      }} />
+
+      <HudCorners color={color} />
+
+      <div className="relative z-10 flex flex-col items-center gap-8 w-full max-w-sm">
+        <div className="flex flex-col items-center gap-2">
+          <div className="flex items-center gap-3 sm:gap-4">
+            <div className="h-px w-12 sm:w-16" style={{ background: `linear-gradient(to right, transparent, rgba(${color},0.4))` }} />
+            <span className="text-[10px] sm:text-[12px] tracking-[0.5em] sm:tracking-[0.6em]" style={{ color: `rgba(${color},0.6)` }}>
+              J · A · R · V · I · S
+            </span>
+            <div className="h-px w-12 sm:w-16" style={{ background: `linear-gradient(to left, transparent, rgba(${color},0.4))` }} />
+          </div>
+          <span className="text-[7px] sm:text-[8px] tracking-[0.3em] text-center" style={{ color: `rgba(${color},0.25)` }}>
+            STARK INDUSTRIES · AUTONOMOUS INTELLIGENCE
+          </span>
+        </div>
+
+        <div
+          className="w-full flex flex-col gap-4 px-5 py-5 rounded-sm"
+          style={{
+            border: `1px solid rgba(${color},0.18)`,
+            background: "rgba(3,10,16,0.6)",
+            boxShadow: `0 0 30px rgba(${color},0.06) inset`,
+          }}
+        >
+          <span className="text-[8px] tracking-[0.3em]" style={{ color: `rgba(${color},0.4)` }}>
+            SYSTEM AUTHORIZATION REQUIRED
+          </span>
+          <PermissionRow label="LOCATION" status={locStatus} color={color} />
+          <PermissionRow label="MICROPHONE" status={micStatus} color={color} />
+          <PermissionRow label="CAMERA" status={camStatus} color={color} />
+        </div>
+
+        <button
+          type="button"
+          onClick={onRequest}
+          disabled={anyRequesting}
+          className="w-full py-3 rounded-sm text-[10px] sm:text-[11px] tracking-[0.3em] transition-all duration-300"
+          style={{
+            border: `1px solid rgba(${color},0.5)`,
+            color: `rgba(${color},0.9)`,
+            background: `rgba(${color},0.07)`,
+            boxShadow: `0 0 20px rgba(${color},0.12)`,
+            cursor: anyRequesting ? "not-allowed" : "pointer",
+            opacity: anyRequesting ? 0.6 : 1,
+          }}
+        >
+          {buttonLabel}
+        </button>
+
+        {anyDenied && (
+          <p className="text-[9px] tracking-[0.1em] text-center leading-relaxed" style={{ color: "rgba(220,60,60,0.7)" }}>
+            Access denied. Enable location and microphone permissions in your browser settings, then retry.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── HUD Corner Brackets ─────────────────────────────────────────────────────
+function HudCorners({ color }: { color: string }) {
+  const cornerStyle = (pos: "tl" | "tr" | "bl" | "br"): React.CSSProperties => {
+    const base: React.CSSProperties = {
+      position: "absolute",
+      width: "min(7vw, 36px)",
+      height: "min(7vw, 36px)",
+      borderColor: `rgba(${color},0.3)`,
+    };
+    const inset = "max(0.75rem, env(safe-area-inset-top))";
+    const insetBottom = "max(0.75rem, env(safe-area-inset-bottom))";
+    const insetLeft = "max(0.75rem, env(safe-area-inset-left))";
+    const insetRight = "max(0.75rem, env(safe-area-inset-right))";
+    switch (pos) {
+      case "tl": return { ...base, top: inset, left: insetLeft, borderTop: "1px solid", borderLeft: "1px solid", borderColor: `rgba(${color},0.3)` };
+      case "tr": return { ...base, top: inset, right: insetRight, borderTop: "1px solid", borderRight: "1px solid", borderColor: `rgba(${color},0.3)` };
+      case "bl": return { ...base, bottom: insetBottom, left: insetLeft, borderBottom: "1px solid", borderLeft: "1px solid", borderColor: `rgba(${color},0.3)` };
+      case "br": return { ...base, bottom: insetBottom, right: insetRight, borderBottom: "1px solid", borderRight: "1px solid", borderColor: `rgba(${color},0.3)` };
+    }
+  };
+
+  return (
+    <div className="absolute inset-0 pointer-events-none z-10">
+      <div style={cornerStyle("tl")} />
+      <div style={cornerStyle("tr")} />
+      <div style={cornerStyle("bl")} />
+      <div style={cornerStyle("br")} />
+    </div>
+  );
+}
+
+// ─── State Indicator Dot + Label ─────────────────────────────────────────────
+function StateDot({ state, color }: { state: AppState; color: string }) {
+  const label =
+    state === "listening" ? "LISTENING" :
+    state === "thinking" ? "PROCESSING" :
+    state === "speaking" ? "RESPONDING" :
+    "STANDBY";
+
+  return (
+    <div className="flex items-center gap-2">
+      <div
+        className="rounded-full"
+        style={{
+          width: 6,
+          height: 6,
+          background: `rgba(${color},0.9)`,
+          boxShadow: `0 0 10px rgba(${color},0.8)`,
+          animationName: state === "ready" ? "jPulse" : "none",
+          animationDuration: "2s",
+          animationIterationCount: "infinite",
+        }}
+      />
+      <span className="text-[9px] sm:text-[10px] tracking-[0.35em]" style={{ color: `rgba(${color},0.55)` }}>
+        {label}
+      </span>
+    </div>
+  );
+}
+
+// ─── Orb Center Icon/Indicator ───────────────────────────────────────────────
+function OrbCenter({ appState, color }: { appState: AppState; color: string }) {
+  if (appState === "thinking") {
+    return (
+      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+        <div className="flex gap-1.5">
+          {[0, 1, 2].map((i) => (
+            <div
+              key={i}
+              className="rounded-full"
+              style={{
+                width: 6,
+                height: 6,
+                background: `rgba(${color},0.85)`,
+                boxShadow: `0 0 8px rgba(${color},0.6)`,
+                animationName: "jBounce",
+                animationDuration: "1.1s",
+                animationTimingFunction: "ease-in-out",
+                animationIterationCount: "infinite",
+                animationDelay: `${i * 0.15}s`,
+              }}
+            />
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  if (appState === "listening") {
+    return (
+      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+        <div className="flex items-end gap-[3px]" style={{ height: 22 }}>
+          {[0, 1, 2, 3, 4].map((i) => (
+            <div
+              key={i}
+              style={{
+                width: 3,
+                height: "100%",
+                background: `rgba(${color},0.85)`,
+                boxShadow: `0 0 6px rgba(${color},0.5)`,
+                borderRadius: 2,
+                animationName: "jWave",
+                animationDuration: "0.9s",
+                animationTimingFunction: "ease-in-out",
+                animationIterationCount: "infinite",
+                animationDelay: `${i * 0.08}s`,
+                transformOrigin: "bottom",
+              }}
+            />
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // ready / speaking — simple glowing core
+  return (
+    <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+      <div
+        className="rounded-full"
+        style={{
+          width: "22%",
+          height: "22%",
+          background: `radial-gradient(circle, rgba(${color},0.9) 0%, rgba(${color},0.3) 60%, transparent 100%)`,
+          boxShadow: `0 0 ${appState === "speaking" ? 24 : 14}px rgba(${color},0.6)`,
+        }}
+      />
+    </div>
+  );
+}
+
+// ─── Bottom Indicator (hint text) ────────────────────────────────────────────
+function BottomIndicator({ appState, color }: { appState: AppState; color: string }) {
+  const text =
+    appState === "listening" ? "TAP TO STOP LISTENING" :
+    appState === "thinking" ? "TAP TO CANCEL" :
+    appState === "speaking" ? "TAP TO INTERRUPT" :
+    "TAP ORB TO SPEAK";
+
+  return (
+    <div className="flex items-center gap-3">
+      <div className="h-px w-6" style={{ background: `linear-gradient(to right, transparent, rgba(${color},0.3))` }} />
+      <span className="text-[8px] sm:text-[9px] tracking-[0.3em]" style={{ color: `rgba(${color},0.4)` }}>
+        {text}
+      </span>
+      <div className="h-px w-6" style={{ background: `linear-gradient(to left, transparent, rgba(${color},0.3))` }} />
+    </div>
+  );
+}
+
+// ─── Text Fallback Modal ──────────────────────────────────────────────────────
+function TextFallbackModal({
+  color,
+  value,
+  onChange,
+  onSubmit,
+  onClose,
+}: {
+  color: string;
+  value: string;
+  onChange: (v: string) => void;
+  onSubmit: () => void;
+  onClose: () => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const t = setTimeout(() => inputRef.current?.focus(), 50);
+    return () => clearTimeout(t);
+  }, []);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center px-6"
+      style={{ background: "rgba(2,6,9,0.85)", backdropFilter: "blur(4px)" }}
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-sm flex flex-col gap-4 px-5 py-5 rounded-sm"
+        style={{
+          border: `1px solid rgba(${color},0.3)`,
+          background: "rgba(3,10,16,0.95)",
+          boxShadow: `0 0 40px rgba(${color},0.1)`,
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <span className="text-[9px] tracking-[0.3em]" style={{ color: `rgba(${color},0.5)` }}>
+          MANUAL INPUT
+        </span>
+        <input
+          ref={inputRef}
+          type="text"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") onSubmit(); if (e.key === "Escape") onClose(); }}
+          placeholder="Type your query, sir…"
+          className="w-full bg-transparent outline-none text-[14px] py-2 px-1"
+          style={{
+            color: `rgba(${color},0.9)`,
+            borderBottom: `1px solid rgba(${color},0.25)`,
+          }}
+        />
+        <div className="flex gap-3 justify-end">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-2 text-[9px] tracking-[0.25em] rounded-sm"
+            style={{ color: `rgba(${color},0.5)`, border: `1px solid rgba(${color},0.15)` }}
+          >
+            CANCEL
+          </button>
+          <button
+            type="button"
+            onClick={onSubmit}
+            disabled={!value.trim()}
+            className="px-4 py-2 text-[9px] tracking-[0.25em] rounded-sm"
+            style={{
+              color: `rgba(${color},0.95)`,
+              border: `1px solid rgba(${color},0.5)`,
+              background: `rgba(${color},0.08)`,
+              opacity: value.trim() ? 1 : 0.4,
+            }}
+          >
+            SEND
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Main Component ───────────────────────────────────────────────────────────
 export default function JarvisPage() {
   const [appState, setAppState] = useState<AppState>("permissions");
   const [jarvisText, setJarvisText] = useState("Systems online. How can I assist you today, sir?");
@@ -427,10 +847,18 @@ export default function JarvisPage() {
   const [textFallbackOpen, setTextFallbackOpen] = useState(false);
   const [textInput, setTextInput] = useState("");
 
+  // NEW: transcript state
+  const [transcriptLog, setTranscriptLog] = useState<LogEntry[]>([]);
+  const [interimText, setInterimText] = useState("");
+  const logIdRef = useRef(0);
+
+  const addLog = useCallback((type: LogEntry["type"], text: string) => {
+    setTranscriptLog((prev) => [...prev.slice(-30), { id: ++logIdRef.current, type, text }]);
+  }, []);
+
   const [locStatus, setLocStatus] = useState<PermissionState>("idle");
   const [micStatus, setMicStatus] = useState<PermissionState>("idle");
   const [camStatus, setCamStatus] = useState<PermissionState>("idle");
-
   const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);
   const [weather, setWeather] = useState<{ temperature: number; description: string; units: { temperature: string } } | null>(null);
 
@@ -441,8 +869,6 @@ export default function JarvisPage() {
   const locRef = useRef<PermissionState>("idle");
   const micRef = useRef<PermissionState>("idle");
   const camRef = useRef<PermissionState>("idle");
-  // Guards against the synthetic click that fires right after touchend on
-  // mobile browsers, which would otherwise call the orb handler twice.
   const lastPointerActionRef = useRef(0);
 
   useEffect(() => { messagesRef.current = messages; }, [messages]);
@@ -454,14 +880,13 @@ export default function JarvisPage() {
 
   const { speak, stop: stopTTS, unlock: unlockAudio, isSpeaking, isLoading: ttsLoading } = useTTS();
 
-  // Camera is optional/cosmetic for this build — only mic + location are
-  // required to operate the assistant. Gating on camera meant any user who
-  // denies it (or whose device doesn't expose one) got stuck forever.
   const allGranted = locStatus === "granted" && micStatus === "granted";
 
   const handleVoiceInput = useCallback(async (text: string) => {
     if (!text.trim()) return;
     stopTTS();
+    setInterimText("");
+    addLog("heard", text); // Show what was heard
     setAppState("thinking");
 
     const context = [
@@ -492,19 +917,29 @@ export default function JarvisPage() {
       if (!res.ok) throw new Error(data.error);
       const reply = data.reply as string;
       setJarvisText(reply);
+      addLog("reply", reply); // Show reply in log
       setMessages((prev) => [...prev, { role: "assistant", content: reply }]);
       await speak(reply);
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") return;
       const errMsg = "Systems experiencing interference, sir. Please repeat your query.";
       setJarvisText(errMsg);
+      addLog("error", errMsg);
       await speak(errMsg);
     } finally {
       setAppState("ready");
     }
-  }, [speak, stopTTS]);
+  }, [speak, stopTTS, addLog]);
 
-  const { start: startSTT, stop: stopSTT, isListening, supported: sttSupported } = useSTT(handleVoiceInput);
+  const handleInterim = useCallback((text: string) => {
+    setInterimText(text);
+  }, []);
+
+  const { start: startSTT, stop: stopSTT, isListening, supported: sttSupported } = useSTT(
+    handleVoiceInput,
+    handleInterim,
+    addLog
+  );
 
   useEffect(() => {
     if (appState === "thinking") return;
@@ -516,18 +951,11 @@ export default function JarvisPage() {
   useEffect(() => {
     if (allGranted && appState === "permissions") {
       setAppState("ready");
-      // NOTE: this won't reliably play on iOS because it's not inside the
-      // gesture call stack — the unlock() call fired synchronously inside
-      // the INITIALIZE button press (see requestAll) handles that instead.
-      // We still attempt it for desktop browsers where it works fine.
       setTimeout(() => speak(jarvisText), 800);
     }
   }, [allGranted]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const requestAll = useCallback(async () => {
-    // Unlock audio synchronously, inside this user-gesture handler, before
-    // any awaited/async permission prompts run. This is the one moment on
-    // iOS we're guaranteed a real user gesture is on the call stack.
     unlockAudio();
 
     if ("geolocation" in navigator) {
@@ -539,7 +967,7 @@ export default function JarvisPage() {
           try {
             const res = await fetch(`/api/weather?lat=${lat}&lon=${lon}`);
             if (res.ok) setWeather(await res.json());
-          } catch { /* non-blocking */ }
+          } catch {}
         },
         () => setLocStatus("denied"),
         { enableHighAccuracy: false, timeout: 10_000, maximumAge: 60_000 }
@@ -563,10 +991,6 @@ export default function JarvisPage() {
       setMicStatus("denied");
     }
 
-    // Camera is requested separately and never blocks the app from
-    // becoming usable — some users don't have one, and on Android Chrome a
-    // combined audio+video prompt that's partially denied can leave both
-    // permissions stuck in a confusing state.
     setCamStatus("requesting");
     try {
       const v = await navigator.mediaDevices.getUserMedia({ video: true });
@@ -577,19 +1001,17 @@ export default function JarvisPage() {
     }
   }, [unlockAudio]);
 
-  // Single source of truth for "activate the orb" so click (desktop mouse),
-  // touch (iOS/Android browsers), and pointer events never double-fire or
-  // disagree about the current state.
   const activateOrb = useCallback(() => {
     if (!allGranted) return;
-    if (appState === "listening") { stopSTT(); return; }
+    if (appState === "listening") { stopSTT(); setInterimText(""); return; }
     if (appState === "speaking") { stopTTS(); return; }
     if (appState === "thinking") { abortRef.current?.abort(); setAppState("ready"); return; }
     if (appState === "ready") {
       if (!sttSupported) { setTextFallbackOpen(true); return; }
+      addLog("status", "Listening…");
       startSTT();
     }
-  }, [appState, allGranted, sttSupported, startSTT, stopSTT, stopTTS]);
+  }, [appState, allGranted, sttSupported, startSTT, stopSTT, stopTTS, addLog]);
 
   const handlePointerUp = useCallback((e: React.PointerEvent) => {
     e.preventDefault();
@@ -598,8 +1020,6 @@ export default function JarvisPage() {
   }, [activateOrb]);
 
   const handleClick = useCallback(() => {
-    // Suppress the synthetic click mobile browsers fire ~after pointerup;
-    // only handle real mouse clicks here (no recent pointer activation).
     if (Date.now() - lastPointerActionRef.current < 700) return;
     activateOrb();
   }, [activateOrb]);
@@ -620,7 +1040,6 @@ export default function JarvisPage() {
     appState === "listening" ? "220,60,60" :
     appState === "thinking" ? "140,100,255" :
     appState === "speaking" ? "0,212,255" : "0,180,220";
-
   const isActive = appState === "speaking" || appState === "listening";
 
   return (
@@ -632,12 +1051,10 @@ export default function JarvisPage() {
         background: `radial-gradient(ellipse at 50% 50%, rgba(${stateColor},0.04) 0%, #020609 55%, #010305 100%)`,
         transition: "background 1s ease",
       }} />
-
       <div className="absolute inset-0 opacity-[0.025]" style={{
         backgroundImage: "linear-gradient(#00d4ff 1px,transparent 1px),linear-gradient(90deg,#00d4ff 1px,transparent 1px)",
         backgroundSize: "80px 80px",
       }} />
-
       <div className="absolute inset-0 pointer-events-none" style={{
         backgroundImage: "repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,0.05) 3px,rgba(0,0,0,0.05) 4px)",
       }} />
@@ -662,11 +1079,6 @@ export default function JarvisPage() {
           <span className="text-[11px] font-light" style={{ color: `rgba(${stateColor},0.5)` }}>
             {weather.temperature}{weather.units.temperature}
           </span>
-          <div className="flex gap-[2px]">
-            {[3, 5, 4, 6, 3].map((h, i) => (
-              <div key={i} style={{ width: 2, height: h, background: `rgba(${stateColor},0.25)`, borderRadius: 1 }} />
-            ))}
-          </div>
         </div>
       )}
 
@@ -681,7 +1093,7 @@ export default function JarvisPage() {
         </div>
       )}
 
-      {/* MAIN ORB AREA — fluid, viewport-aware sizing instead of a fixed 500px box */}
+      {/* MAIN ORB */}
       <div
         className="relative z-10 flex items-center justify-center"
         style={{
@@ -689,6 +1101,8 @@ export default function JarvisPage() {
           height: "min(85vw, 420px)",
           maxWidth: "min(85vh, 420px)",
           maxHeight: "min(85vh, 420px)",
+          // Push orb upward to make room for the transcript panel below
+          marginBottom: "min(30vw, 140px)",
         }}
       >
         <AudioVisualizer appState={appState} />
@@ -696,23 +1110,8 @@ export default function JarvisPage() {
 
         {isActive && (
           <>
-            <div className="absolute rounded-full" style={{
-              width: "76%", height: "76%",
-              border: `1px solid rgba(${stateColor},0.15)`,
-              animationName: "jPing",
-              animationDuration: "2.2s",
-              animationTimingFunction: "ease-out",
-              animationIterationCount: "infinite",
-            }} />
-            <div className="absolute rounded-full" style={{
-              width: "76%", height: "76%",
-              border: `1px solid rgba(${stateColor},0.1)`,
-              animationName: "jPing",
-              animationDuration: "2.2s",
-              animationTimingFunction: "ease-out",
-              animationIterationCount: "infinite",
-              animationDelay: "0.8s",
-            }} />
+            <div className="absolute rounded-full" style={{ width: "76%", height: "76%", border: `1px solid rgba(${stateColor},0.15)`, animationName: "jPing", animationDuration: "2.2s", animationTimingFunction: "ease-out", animationIterationCount: "infinite" }} />
+            <div className="absolute rounded-full" style={{ width: "76%", height: "76%", border: `1px solid rgba(${stateColor},0.1)`, animationName: "jPing", animationDuration: "2.2s", animationTimingFunction: "ease-out", animationIterationCount: "infinite", animationDelay: "0.8s" }} />
           </>
         )}
 
@@ -721,48 +1120,37 @@ export default function JarvisPage() {
           onPointerUp={handlePointerUp}
           onClick={handleClick}
           disabled={appState === "thinking"}
-          aria-label={
-            appState === "listening" ? "Stop listening" :
-            appState === "speaking" ? "Stop speaking" :
-            appState === "thinking" ? "Processing" : "Start voice input"
-          }
+          aria-label={appState === "listening" ? "Stop listening" : appState === "speaking" ? "Stop speaking" : appState === "thinking" ? "Processing" : "Start voice input"}
           className="absolute rounded-full focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 transition-all duration-700"
           style={{
-            width: "36%",
-            height: "36%",
-            minWidth: 120,
-            minHeight: 120,
+            width: "36%", height: "36%", minWidth: 120, minHeight: 120,
             outlineColor: `rgba(${stateColor},0.6)`,
             WebkitTapHighlightColor: "transparent",
             touchAction: "manipulation",
             background:
-              appState === "listening"
-                ? "radial-gradient(circle at 38% 35%, rgba(255,100,100,0.28) 0%, rgba(160,30,30,0.18) 45%, rgba(25,4,4,0.94) 100%)"
-                : appState === "thinking"
-                ? "radial-gradient(circle at 38% 35%, rgba(180,140,255,0.22) 0%, rgba(80,40,180,0.12) 45%, rgba(5,2,18,0.94) 100%)"
-                : appState === "speaking"
-                ? "radial-gradient(circle at 38% 35%, rgba(80,230,255,0.25) 0%, rgba(0,130,200,0.15) 45%, rgba(1,10,20,0.94) 100%)"
-                : "radial-gradient(circle at 38% 35%, rgba(20,130,180,0.1) 0%, rgba(0,50,80,0.06) 45%, rgba(2,8,16,0.95) 100%)",
+              appState === "listening" ? "radial-gradient(circle at 38% 35%, rgba(255,100,100,0.28) 0%, rgba(160,30,30,0.18) 45%, rgba(25,4,4,0.94) 100%)" :
+              appState === "thinking" ? "radial-gradient(circle at 38% 35%, rgba(180,140,255,0.22) 0%, rgba(80,40,180,0.12) 45%, rgba(5,2,18,0.94) 100%)" :
+              appState === "speaking" ? "radial-gradient(circle at 38% 35%, rgba(80,230,255,0.25) 0%, rgba(0,130,200,0.15) 45%, rgba(1,10,20,0.94) 100%)" :
+              "radial-gradient(circle at 38% 35%, rgba(20,130,180,0.1) 0%, rgba(0,50,80,0.06) 45%, rgba(2,8,16,0.95) 100%)",
             border: `1px solid rgba(${stateColor},${isActive ? 0.55 : 0.18})`,
-            boxShadow: isActive
-              ? `0 0 80px rgba(${stateColor},0.35), 0 0 30px rgba(${stateColor},0.18) inset, 0 0 120px rgba(${stateColor},0.12)`
-              : appState === "thinking"
-              ? `0 0 40px rgba(${stateColor},0.2), 0 0 12px rgba(${stateColor},0.08) inset`
-              : `0 0 18px rgba(${stateColor},0.08)`,
+            boxShadow: isActive ? `0 0 80px rgba(${stateColor},0.35), 0 0 30px rgba(${stateColor},0.18) inset, 0 0 120px rgba(${stateColor},0.12)` : appState === "thinking" ? `0 0 40px rgba(${stateColor},0.2), 0 0 12px rgba(${stateColor},0.08) inset` : `0 0 18px rgba(${stateColor},0.08)`,
             cursor: appState === "thinking" ? "not-allowed" : "pointer",
           }}
         >
-          <div className="absolute rounded-full pointer-events-none" style={{
-            width: "32%", height: "18%", top: "16%", left: "19%",
-            background: "radial-gradient(ellipse, rgba(255,255,255,0.09) 0%, transparent 100%)",
-            transform: "rotate(-22deg)",
-          }} />
-
+          <div className="absolute rounded-full pointer-events-none" style={{ width: "32%", height: "18%", top: "16%", left: "19%", background: "radial-gradient(ellipse, rgba(255,255,255,0.09) 0%, transparent 100%)", transform: "rotate(-22deg)" }} />
           <OrbCenter appState={appState} color={stateColor} />
         </button>
       </div>
 
-      <div className="absolute z-10 flex justify-center px-4" style={{ bottom: "max(2rem, calc(env(safe-area-inset-bottom) + 1rem))" }}>
+      {/* TRANSCRIPT PANEL — always visible */}
+      <TranscriptPanel
+        log={transcriptLog}
+        interimText={interimText}
+        jarvisText={jarvisText}
+        color={stateColor}
+      />
+
+      <div className="absolute z-10 flex justify-center px-4" style={{ bottom: "max(0.5rem, calc(env(safe-area-inset-bottom) + 0.25rem))" }}>
         <BottomIndicator appState={appState} color={stateColor} />
       </div>
 
@@ -780,394 +1168,8 @@ export default function JarvisPage() {
         @keyframes jSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         @keyframes jPing { 0% { transform: scale(1); opacity: 0.6; } 100% { transform: scale(1.55); opacity: 0; } }
         @keyframes jPulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
-        @keyframes jBounce {
-          0%,100% { transform: translateY(0); }
-          50% { transform: translateY(-6px); }
-        }
-        @keyframes jWave {
-          0%,100% { transform: scaleY(0.25); }
-          50% { transform: scaleY(1); }
-        }
-        @media (prefers-reduced-motion: reduce) {
-          * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; }
-        }
-      `}</style>
-    </div>
-  );
-}
-
-// ─── Text Fallback Modal (for browsers without SpeechRecognition) ────────────
-
-function TextFallbackModal({ color, value, onChange, onSubmit, onClose }: {
-  color: string; value: string; onChange: (v: string) => void; onSubmit: () => void; onClose: () => void;
-}) {
-  const inputRef = useRef<HTMLInputElement>(null);
-  useEffect(() => { inputRef.current?.focus(); }, []);
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center px-4 pb-[max(1rem,env(safe-area-inset-bottom))]"
-      style={{ background: "rgba(2,6,9,0.75)" }}
-      onClick={onClose}
-    >
-      <div
-        className="w-full max-w-sm rounded-md p-4 flex flex-col gap-3"
-        style={{ background: "#040b10", border: `1px solid rgba(${color},0.25)` }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <span className="text-[8px] tracking-[0.3em]" style={{ color: `rgba(${color},0.6)` }}>TYPE YOUR QUERY</span>
-        <input
-          ref={inputRef}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") onSubmit(); }}
-          className="w-full rounded-sm px-3 py-2.5 text-sm bg-transparent outline-none"
-          style={{ border: `1px solid rgba(${color},0.3)`, color: `rgba(${color},0.9)` }}
-          placeholder="Ask J.A.R.V.I.S. anything…"
-          autoComplete="off"
-          autoCapitalize="sentences"
-        />
-        <div className="flex gap-2">
-          <button
-            onClick={onClose}
-            className="flex-1 py-2.5 rounded-sm text-[9px] tracking-[0.25em]"
-            style={{ border: `1px solid rgba(${color},0.15)`, color: `rgba(${color},0.5)` }}
-          >
-            CANCEL
-          </button>
-          <button
-            onClick={onSubmit}
-            className="flex-1 py-2.5 rounded-sm text-[9px] tracking-[0.25em]"
-            style={{ border: `1px solid rgba(${color},0.4)`, color: `rgba(${color},0.9)`, background: `rgba(${color},0.08)` }}
-          >
-            SEND
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── Orb Center ───────────────────────────────────────────────────────────────
-
-function OrbCenter({ appState, color }: { appState: AppState; color: string }) {
-  if (appState === "thinking") {
-    return (
-      <div className="absolute inset-0 flex items-center justify-center">
-        <div className="relative w-12 h-12">
-          {[0, 120, 240].map((deg, i) => (
-            <div key={i} className="absolute inset-0 flex items-center justify-center" style={{
-              animationName: "jSpin",
-              animationDuration: `${1.8 + i * 0.15}s`,
-              animationTimingFunction: "linear",
-              animationIterationCount: "infinite",
-              animationDirection: i % 2 === 0 ? "normal" : "reverse",
-            }}>
-              <div className="absolute rounded-full" style={{
-                width: 7, height: 7,
-                background: `rgba(${color},0.85)`,
-                boxShadow: `0 0 10px rgba(${color},0.8)`,
-                transform: `rotate(${deg}deg) translateX(18px)`,
-              }} />
-            </div>
-          ))}
-          <div className="absolute inset-0 flex items-center justify-center">
-            <div className="rounded-full" style={{
-              width: 6, height: 6,
-              background: `rgba(${color},0.5)`,
-              boxShadow: `0 0 8px rgba(${color},0.6)`,
-            }} />
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  if (appState === "listening" || appState === "speaking") {
-    const heights = appState === "listening"
-      ? [5, 12, 9, 18, 8, 14, 9, 18, 8, 12, 5]
-      : [6, 14, 10, 20, 14, 24, 14, 20, 10, 14, 6];
-
-    return (
-      <div className="absolute inset-0 flex items-center justify-center">
-        <div className="flex items-center gap-[2.5px]">
-          {heights.map((h, i) => (
-            <div key={i} style={{
-              width: 3,
-              height: h,
-              background: `rgba(${color},0.85)`,
-              borderRadius: 2,
-              boxShadow: `0 0 6px rgba(${color},0.7)`,
-              animationName: "jWave",
-              animationDuration: appState === "listening" ? "0.65s" : "0.5s",
-              animationTimingFunction: "ease-in-out",
-              animationIterationCount: "infinite",
-              animationDelay: `${i * 55}ms`,
-            }} />
-          ))}
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="absolute inset-0 flex items-center justify-center">
-      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke={`rgba(${color},0.4)`} strokeWidth="1.5" strokeLinecap="round">
-        <rect x="9" y="2" width="6" height="12" rx="3" />
-        <path d="M5 10a7 7 0 0 0 14 0" />
-        <line x1="12" y1="19" x2="12" y2="22" />
-        <line x1="9" y1="22" x2="15" y2="22" />
-      </svg>
-    </div>
-  );
-}
-
-// ─── State Dot ────────────────────────────────────────────────────────────────
-
-function StateDot({ state, color }: { state: AppState; color: string }) {
-  const isActive = state !== "ready";
-  return (
-    <div className="flex items-center gap-2">
-      <div style={{
-        width: 6, height: 6,
-        borderRadius: "50%",
-        background: `rgba(${color},0.9)`,
-        boxShadow: `0 0 8px 3px rgba(${color},0.5)`,
-        animationName: isActive ? "jPulse" : "none",
-        animationDuration: "1.4s",
-        animationTimingFunction: "ease-in-out",
-        animationIterationCount: "infinite",
-      }} />
-      <div className="flex gap-1">
-        {[1, 1, 0.5, 0.3].map((o, i) => (
-          <div key={i} style={{ width: 6, height: 1, background: `rgba(${color},${o * 0.4})`, borderRadius: 1 }} />
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ─── Bottom Indicator ─────────────────────────────────────────────────────────
-
-function BottomIndicator({ appState, color }: { appState: AppState; color: string }) {
-  if (appState === "ready") {
-    return (
-      <div className="flex flex-col items-center gap-2">
-        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
-          <circle cx="10" cy="10" r="8" stroke={`rgba(${color},0.2)`} strokeWidth="1" />
-          <circle cx="10" cy="10" r="4" stroke={`rgba(${color},0.3)`} strokeWidth="1" />
-          <circle cx="10" cy="10" r="1.5" fill={`rgba(${color},0.5)`} />
-        </svg>
-        <div className="flex gap-1">
-          {[4, 6, 4].map((w, i) => <div key={i} style={{ width: w, height: 1, background: `rgba(${color},0.2)`, borderRadius: 1 }} />)}
-        </div>
-      </div>
-    );
-  }
-  if (appState === "listening") {
-    return (
-      <svg width="24" height="16" viewBox="0 0 24 16" fill="none">
-        {[0, 1, 2, 3].map((i) => (
-          <rect key={i} x={i * 6} y={4 + i % 2 * 2} width="3" height={8 - i % 2 * 4} rx="1.5"
-            fill={`rgba(${color},0.4)`} style={{
-              animationName: "jWave", animationDuration: "0.7s", animationTimingFunction: "ease-in-out",
-              animationIterationCount: "infinite", animationDelay: `${i * 80}ms`,
-            }} />
-        ))}
-      </svg>
-    );
-  }
-  if (appState === "speaking") {
-    return (
-      <svg width="22" height="18" viewBox="0 0 22 18" fill="none" style={{ opacity: 0.5 }}>
-        <path d="M3 6H1v6h2l5 4V2L3 6z" fill={`rgba(${color},0.4)`} />
-        <path d="M11 5a5 5 0 0 1 0 8" stroke={`rgba(${color},0.4)`} strokeWidth="1.5" strokeLinecap="round" fill="none" style={{
-          animationName: "jPulse", animationDuration: "1.2s", animationTimingFunction: "ease-in-out", animationIterationCount: "infinite",
-        }} />
-      </svg>
-    );
-  }
-  if (appState === "thinking") {
-    return (
-      <div className="flex gap-2">
-        {[0, 200, 400].map((d, i) => (
-          <div key={i} className="rounded-full" style={{
-            width: 5, height: 5,
-            background: `rgba(${color},0.5)`,
-            animationName: "jBounce", animationDuration: "0.9s", animationTimingFunction: "ease-in-out",
-            animationIterationCount: "infinite", animationDelay: `${d}ms`,
-          }} />
-        ))}
-      </div>
-    );
-  }
-  return null;
-}
-
-// ─── HUD Corner Brackets ──────────────────────────────────────────────────────
-
-function HudCorners({ color }: { color: string }) {
-  const size = 28;
-  const thickness = 1.5;
-  const c = `rgba(${color},0.2)`;
-  const corners = [
-    { top: 0, left: 0, borderTop: thickness, borderLeft: thickness },
-    { top: 0, right: 0, borderTop: thickness, borderRight: thickness },
-    { bottom: 0, left: 0, borderBottom: thickness, borderLeft: thickness },
-    { bottom: 0, right: 0, borderBottom: thickness, borderRight: thickness },
-  ];
-  return (
-    <>
-      {corners.map((style, i) => (
-        <div key={i} className="absolute z-20" style={{
-          ...Object.fromEntries(Object.entries(style).map(([k, v]) => [k, typeof v === "number" ? (k.startsWith("border") ? `${v}px solid ${c}` : v) : v])),
-          width: size, height: size,
-          margin: "max(0.75rem, env(safe-area-inset-top))",
-        }} />
-      ))}
-    </>
-  );
-}
-
-// ─── Permissions Screen ───────────────────────────────────────────────────────
-
-function PermissionsScreen({ locStatus, micStatus, camStatus, onRequest }: {
-  locStatus: PermissionState; micStatus: PermissionState; camStatus: PermissionState; onRequest: () => void;
-}) {
-  const items = [
-    { label: "LOCATION", status: locStatus, required: true },
-    { label: "MICROPHONE", status: micStatus, required: true },
-    { label: "CAMERA", status: camStatus, required: false },
-  ];
-  const anyRequesting = items.some((i) => i.status === "requesting");
-  const requiredDenied = items.some((i) => i.required && (i.status === "denied" || i.status === "error" || i.status === "unsupported"));
-
-  return (
-    <div className="min-h-[100dvh] bg-[#020609] flex flex-col items-center justify-center font-mono relative overflow-hidden">
-      <div className="absolute inset-0" style={{ background: "radial-gradient(ellipse at 50% 40%, #041420 0%, #020609 70%)" }} />
-      <div className="absolute inset-0 opacity-[0.03]" style={{
-        backgroundImage: "linear-gradient(#00d4ff 1px,transparent 1px),linear-gradient(90deg,#00d4ff 1px,transparent 1px)",
-        backgroundSize: "60px 60px",
-      }} />
-      <HudCorners color="0,180,220" />
-
-      <div className="relative z-10 flex flex-col items-center gap-6 sm:gap-8 px-6 sm:px-8 max-w-sm w-full py-8" style={{ paddingTop: "max(2rem, env(safe-area-inset-top))", paddingBottom: "max(2rem, env(safe-area-inset-bottom))" }}>
-        <div className="flex flex-col items-center gap-2">
-          <div className="flex items-center gap-3">
-            <div className="h-px w-14" style={{ background: "linear-gradient(to right, transparent, rgba(0,212,255,0.4))" }} />
-            <span className="text-[11px] sm:text-[12px] tracking-[0.5em] sm:tracking-[0.55em]" style={{ color: "rgba(0,212,255,0.65)" }}>J · A · R · V · I · S</span>
-            <div className="h-px w-14" style={{ background: "linear-gradient(to left, transparent, rgba(0,212,255,0.4))" }} />
-          </div>
-          <span className="text-[7px] tracking-[0.3em] text-center" style={{ color: "rgba(0,180,220,0.25)" }}>STARK INDUSTRIES · AUTONOMOUS INTELLIGENCE</span>
-        </div>
-
-        <div className="relative flex items-center justify-center" style={{ width: "min(50vw, 200px)", height: "min(50vw, 200px)" }}>
-          {[200, 160, 120].map((s, i) => (
-            <div key={i} className="absolute rounded-full" style={{
-              width: `${(s / 200) * 100}%`, height: `${(s / 200) * 100}%`,
-              border: `1px solid rgba(0,212,255,${0.06 - i * 0.015})`,
-              animationName: "jSpin",
-              animationDuration: `${20 + i * 8}s`,
-              animationTimingFunction: "linear",
-              animationIterationCount: "infinite",
-              animationDirection: i % 2 === 0 ? "normal" : "reverse",
-            }} />
-          ))}
-          <div className="rounded-full flex items-center justify-center" style={{
-            width: "45%", height: "45%",
-            background: "radial-gradient(circle at 38% 35%, rgba(15,50,70,0.25) 0%, rgba(2,8,15,0.96) 100%)",
-            border: "1px solid rgba(0,212,255,0.1)",
-            boxShadow: "0 0 30px rgba(0,212,255,0.08)",
-          }}>
-            <div className="rounded-full" style={{
-              width: 18, height: 18,
-              background: "rgba(0,212,255,0.12)",
-              border: "1px solid rgba(0,212,255,0.2)",
-              boxShadow: "0 0 12px rgba(0,212,255,0.2)",
-              animationName: "jPulse",
-              animationDuration: "2.5s",
-              animationTimingFunction: "ease-in-out",
-              animationIterationCount: "infinite",
-            }} />
-          </div>
-        </div>
-
-        <div className="w-full flex flex-col gap-2.5">
-          {items.map(({ label, status, required }) => {
-            const dotColor = status === "granted" ? "74,201,138" : (status === "denied" || status === "unsupported") ? "224,85,85" : status === "requesting" ? "245,166,35" : "30,60,80";
-            return (
-              <div key={label} className="flex items-center justify-between px-4 py-3 rounded-sm" style={{
-                border: "1px solid rgba(10,26,39,0.9)",
-                background: "rgba(3,10,16,0.85)",
-              }}>
-                <span className="text-[8px] tracking-[0.3em]" style={{ color: "rgba(0,180,220,0.5)" }}>
-                  {label}{!required && <span style={{ opacity: 0.5 }}> · OPTIONAL</span>}
-                </span>
-                <div className="flex items-center gap-2">
-                  <div style={{
-                    width: 6, height: 6, borderRadius: "50%",
-                    background: `rgba(${dotColor},0.9)`,
-                    boxShadow: status === "granted" || status === "denied" ? `0 0 7px 2px rgba(${dotColor},0.5)` : "none",
-                    animationName: status === "requesting" ? "jPulse" : "none",
-                    animationDuration: "1s",
-                    animationTimingFunction: "ease-in-out",
-                    animationIterationCount: "infinite",
-                  }} />
-                  <span className="text-[7px] tracking-[0.25em]" style={{ color: `rgba(${dotColor},0.7)` }}>
-                    {status === "granted" ? "ONLINE" : status === "denied" ? "DENIED" : status === "unsupported" ? "N/A" : status === "requesting" ? "INIT" : "OFFLINE"}
-                  </span>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-
-        {requiredDenied ? (
-          <div className="w-full flex flex-col items-center gap-3">
-            <div className="flex gap-1">
-              {[6, 4, 6].map((w, i) => <div key={i} style={{ width: w, height: 1, background: "rgba(224,85,85,0.4)", borderRadius: 1 }} />)}
-            </div>
-            <span className="text-[7px] tracking-[0.2em] text-center" style={{ color: "rgba(224,85,85,0.6)" }}>
-              ENABLE LOCATION &amp; MICROPHONE IN BROWSER SETTINGS
-            </span>
-            <button onClick={onRequest} className="px-8 py-2.5 rounded-sm transition-all active:scale-[0.98]" style={{
-              border: "1px solid rgba(224,85,85,0.3)",
-              color: "rgba(224,85,85,0.65)",
-              fontSize: "9px",
-              letterSpacing: "0.25em",
-              background: "rgba(224,85,85,0.04)",
-              touchAction: "manipulation",
-              WebkitTapHighlightColor: "transparent",
-            }}>RETRY</button>
-          </div>
-        ) : (
-          <button
-            onClick={onRequest}
-            disabled={anyRequesting}
-            className="w-full py-3.5 rounded-sm transition-all active:scale-[0.98]"
-            style={{
-              border: "1px solid rgba(0,212,255,0.22)",
-              background: "rgba(0,212,255,0.04)",
-              color: "rgba(0,212,255,0.65)",
-              fontSize: "9px",
-              letterSpacing: "0.35em",
-              opacity: anyRequesting ? 0.45 : 1,
-              cursor: anyRequesting ? "not-allowed" : "pointer",
-              touchAction: "manipulation",
-              WebkitTapHighlightColor: "transparent",
-            }}
-          >
-            {anyRequesting ? "INITIALIZING…" : "INITIALIZE J.A.R.V.I.S."}
-          </button>
-        )}
-      </div>
-
-      <style>{`
-        @keyframes jSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-        @keyframes jPulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
-        @keyframes jWave { 0%,100% { transform: scaleY(0.25); } 50% { transform: scaleY(1); } }
         @keyframes jBounce { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
-        @keyframes jPing { 0% { transform: scale(1); opacity: 0.5; } 100% { transform: scale(1.6); opacity: 0; } }
+        @keyframes jWave { 0%,100% { transform: scaleY(0.25); } 50% { transform: scaleY(1); } }
         @media (prefers-reduced-motion: reduce) {
           * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; }
         }

@@ -991,7 +991,7 @@ export default function JarvisPage() {
   const isActive = appState === "speaking" || appState === "listening";
 
   // Panels visible only during listening and speaking
-  const showPanels = appState === "listening" || appState === "speaking";
+  const showPanels = false;
 
   return (
     <div

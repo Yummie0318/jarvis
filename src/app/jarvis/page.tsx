@@ -15,6 +15,47 @@ interface LogEntry {
   text: string;
 }
 
+// ─── Address-term parsing ───────────────────────────────────────────────────
+// Instead of guessing the user's gender from their voice (unreliable and easy
+// to get wrong/offensive), we just ask once and remember whatever they say.
+function capitalizeWords(s: string): string {
+  return s.replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function extractAddressTerm(raw: string): string {
+  const text = raw.trim();
+  if (!text) return "sir";
+  const lower = text.toLowerCase();
+
+  const patterns: RegExp[] = [
+    /(?:you can |please |just )?call me ([a-zA-Z' -]{1,24})/i,
+    /address me as ([a-zA-Z' -]{1,24})/i,
+    /my name is ([a-zA-Z' -]{1,24})/i,
+    /i'?m\s+([a-zA-Z' -]{1,24})/i,
+  ];
+  for (const p of patterns) {
+    const m = text.match(p);
+    if (m && m[1]) {
+      const captured = m[1].trim().split(/\s+/).slice(0, 2).join(" ");
+      if (captured) return capitalizeWords(captured);
+    }
+  }
+
+  if (/\bsir\b/.test(lower)) return "sir";
+  if (/\bma'?am\b|\bmadam\b/.test(lower)) return "ma'am";
+  if (/\bmiss\b/.test(lower)) return "miss";
+  if (/\bboss\b/.test(lower)) return "boss";
+  if (/\bcaptain\b/.test(lower)) return "captain";
+  if (/\bdoctor\b|\bdr\b/.test(lower)) return "doctor";
+
+  // Short utterance with no recognizable pattern — treat it as a name/title directly.
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length > 0 && words.length <= 3) {
+    return capitalizeWords(words.join(" "));
+  }
+  return "sir";
+}
+
 // ─── Shared Audio Analyser ──────────────────────────────────────────────────
 class AudioAnalyserBus {
   ctx: AudioContext | null = null;
@@ -208,14 +249,50 @@ function useSTT(
 ) {
   const recognitionRef = useRef<AnyRecognition | null>(null);
   const userWantsListeningRef = useRef(false);
+  // True from the moment the user asks to stop until we've actually
+  // produced a result. While true, an onend from the recognition object
+  // means "this is the result coming in", not "restart me".
+  const stoppingRef = useRef(false);
+  // Guards against finalize() running twice for the same stop cycle
+  // (e.g. onend fires AND the safety-net timeout fires).
+  const finalizingRef = useRef(false);
   const accumulatedFinalRef = useRef("");
   const latestInterimRef = useRef("");
+  const finalizeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [isListening, setIsListening] = useState(false);
   const [supported, setSupported] = useState(true);
 
   useEffect(() => {
     setSupported(getSpeechRecognitionCtor() !== null);
   }, []);
+
+  const clearFinalizeTimeout = useCallback(() => {
+    if (finalizeTimeoutRef.current) {
+      clearTimeout(finalizeTimeoutRef.current);
+      finalizeTimeoutRef.current = null;
+    }
+  }, []);
+
+  const finalize = useCallback(() => {
+    if (finalizingRef.current) return;
+    finalizingRef.current = true;
+    clearFinalizeTimeout();
+    stoppingRef.current = false;
+    setIsListening(false);
+    onInterim("");
+
+    const finals = accumulatedFinalRef.current.trim();
+    const interim = latestInterimRef.current.trim();
+    accumulatedFinalRef.current = "";
+    latestInterimRef.current = "";
+
+    const text = finals || interim;
+    if (text) {
+      onResult(text);
+    } else {
+      onLog("status", "No speech detected");
+    }
+  }, [onResult, onInterim, onLog, clearFinalizeTimeout]);
 
   const createRecognition = useCallback(() => {
     const SR = getSpeechRecognitionCtor();
@@ -232,7 +309,21 @@ function useSTT(
     };
 
     rec.onend = () => {
+      // The user asked to stop — this IS the natural end of the session.
+      // Any final transcript should have already arrived via onresult by
+      // now, so it's safe to finalize. (Previously we called abort()
+      // immediately after stop(), which on Android — where recognition is
+      // processed server-side with real latency — discarded the final
+      // transcript before it arrived. That was the "nothing happens"
+      // bug.)
+      if (stoppingRef.current) {
+        finalize();
+        return;
+      }
       if (userWantsListeningRef.current) {
+        // Some Android builds end the session on their own even in
+        // continuous mode. Restart transparently without losing anything
+        // already accumulated.
         try {
           const fresh = createRecognition();
           if (fresh) {
@@ -254,6 +345,7 @@ function useSTT(
       onLog("error", `Speech error: ${e.error}`);
       if (e.error === "not-allowed" || e.error === "service-not-allowed") {
         userWantsListeningRef.current = false;
+        stoppingRef.current = false;
         setIsListening(false);
       }
     };
@@ -275,13 +367,15 @@ function useSTT(
     };
 
     return rec;
-  }, [onInterim, onLog]);
+  }, [onInterim, onLog, finalize]);
 
   const start = useCallback(() => {
     if (userWantsListeningRef.current) return;
     const SR = getSpeechRecognitionCtor();
     if (!SR) { setSupported(false); return; }
     userWantsListeningRef.current = true;
+    stoppingRef.current = false;
+    finalizingRef.current = false;
     accumulatedFinalRef.current = "";
     latestInterimRef.current = "";
     const rec = createRecognition();
@@ -298,30 +392,33 @@ function useSTT(
   }, [createRecognition, onLog]);
 
   const stop = useCallback(() => {
+    if (!userWantsListeningRef.current) return;
     userWantsListeningRef.current = false;
-    try { recognitionRef.current?.stop(); } catch {}
-    try { recognitionRef.current?.abort(); } catch {}
-    recognitionRef.current = null;
-    setIsListening(false);
-    onInterim("");
+    stoppingRef.current = true;
+    onLog("status", "Processing speech…");
 
-    const finals = accumulatedFinalRef.current.trim();
-    const interim = latestInterimRef.current.trim();
-    accumulatedFinalRef.current = "";
-    latestInterimRef.current = "";
-
-    const text = finals || interim;
-    if (text) {
-      onResult(text);
-    } else {
-      onLog("status", "No speech detected");
+    try {
+      recognitionRef.current?.stop();
+    } catch {
+      finalize();
+      return;
     }
-  }, [onResult, onInterim, onLog]);
+
+    // Safety net: if onend never fires (seen on some Android builds when
+    // the network round-trip stalls), don't leave the user stuck forever.
+    clearFinalizeTimeout();
+    finalizeTimeoutRef.current = setTimeout(() => {
+      try { recognitionRef.current?.abort(); } catch {}
+      finalize();
+    }, 4000);
+  }, [onLog, finalize, clearFinalizeTimeout]);
 
   useEffect(() => () => {
     userWantsListeningRef.current = false;
+    stoppingRef.current = false;
+    clearFinalizeTimeout();
     try { recognitionRef.current?.abort(); } catch {}
-  }, []);
+  }, [clearFinalizeTimeout]);
 
   return { start, stop, isListening, supported };
 }
@@ -390,7 +487,6 @@ function AudioVisualizer({ appState, micStream }: { appState: AppState; micStrea
           return v + (target - v) * 0.08;
         }
         if (isThinking) {
-          // Enhanced thinking: ripple wave that travels around the ring
           const angle = (i / BAR_COUNT) * Math.PI * 2;
           const ripple1 = Math.sin(angle * 3 - t * 2.5) * 0.5 + 0.5;
           const ripple2 = Math.sin(angle * 5 + t * 1.8) * 0.5 + 0.5;
@@ -417,7 +513,6 @@ function AudioVisualizer({ appState, micStream }: { appState: AppState; micStrea
         if (appState === "listening") {
           r = 220 + Math.floor(barH * 35); g = 60 + Math.floor(barH * 40); b = 60 + Math.floor(barH * 20);
         } else if (appState === "thinking") {
-          // Shifting purple-to-cyan hue during thinking
           const hShift = Math.sin(timeRef.current * 0.8 + i * 0.15) * 0.5 + 0.5;
           r = Math.floor(80 + hShift * 120 + barH * 55);
           g = Math.floor(60 + barH * 80);
@@ -471,7 +566,6 @@ function AudioVisualizer({ appState, micStream }: { appState: AppState; micStrea
       safeCtx.fillStyle = outerGlow;
       safeCtx.fill();
 
-      // Extra inner glow ring for thinking state
       if (isThinking) {
         const innerGlowR = coreR * 0.6;
         const innerGlow = safeCtx.createRadialGradient(cx, cy, innerGlowR * 0.2, cx, cy, innerGlowR);
@@ -665,7 +759,6 @@ function StateDot({ state, color }: { state: AppState; color: string }) {
 // ─── Orb Center Icon/Indicator ───────────────────────────────────────────────
 function OrbCenter({ appState, color }: { appState: AppState; color: string }) {
   if (appState === "thinking") {
-    // Rotating arc/spinner instead of bouncing dots
     return (
       <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
         <div style={{
@@ -719,8 +812,10 @@ function OrbCenter({ appState, color }: { appState: AppState; color: string }) {
 }
 
 // ─── Bottom Indicator ────────────────────────────────────────────────────────
-function BottomIndicator({ appState, color }: { appState: AppState; color: string }) {
+function BottomIndicator({ appState, color, addressMode }: { appState: AppState; color: string; addressMode?: boolean }) {
   const text =
+    addressMode && appState === "ready" ? "TAP ORB TO TELL JARVIS HOW TO ADDRESS YOU" :
+    addressMode && appState === "listening" ? "SAY HOW YOU'D LIKE TO BE ADDRESSED" :
     appState === "listening" ? "TAP TO STOP & SEND" :
     appState === "thinking" ? "PROCESSING YOUR REQUEST" :
     appState === "speaking" ? "TAP TO INTERRUPT" :
@@ -736,11 +831,12 @@ function BottomIndicator({ appState, color }: { appState: AppState; color: strin
 }
 
 // ─── Text Fallback Modal ──────────────────────────────────────────────────────
-function TextFallbackModal({ color, value, onChange, onSubmit, onClose }: {
+function TextFallbackModal({ color, value, onChange, onSubmit, onClose, placeholder }: {
   color: string; value: string;
   onChange: (v: string) => void;
   onSubmit: () => void;
   onClose: () => void;
+  placeholder?: string;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
@@ -758,7 +854,7 @@ function TextFallbackModal({ color, value, onChange, onSubmit, onClose }: {
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") onSubmit(); if (e.key === "Escape") onClose(); }}
-          placeholder="Type your query, sir…"
+          placeholder={placeholder || "Type your query, sir…"}
           className="w-full bg-transparent outline-none text-[14px] py-2 px-1"
           style={{ color: `rgba(${color},0.9)`, borderBottom: `1px solid rgba(${color},0.25)` }}
         />
@@ -796,6 +892,18 @@ export default function JarvisPage() {
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
 
+  // Address preference — asked once on first boot, remembered for the
+  // session (per the "per-session memory is fine" decision). Replaces
+  // guessing gender from voice, which is unreliable and easy to get wrong.
+  const [addressTerm, setAddressTermState] = useState<string>("sir");
+  const addressTermRef = useRef<string>("sir");
+  const [awaitingAddress, setAwaitingAddressState] = useState(false);
+  const awaitingAddressRef = useRef(false);
+  const setAwaitingAddress = useCallback((v: boolean) => {
+    awaitingAddressRef.current = v;
+    setAwaitingAddressState(v);
+  }, []);
+
   const abortRef = useRef<AbortController | null>(null);
   const messagesRef = useRef<Message[]>([]);
   const coordsRef = useRef<{ lat: number; lon: number } | null>(null);
@@ -810,6 +918,7 @@ export default function JarvisPage() {
   useEffect(() => { locRef.current = locStatus; }, [locStatus]);
   useEffect(() => { micRef.current = micStatus; }, [micStatus]);
   useEffect(() => { camRef.current = camStatus; }, [camStatus]);
+  useEffect(() => { addressTermRef.current = addressTerm; }, [addressTerm]);
 
   const { speak, stop: stopTTS, unlock: unlockAudio } = useTTS();
 
@@ -844,6 +953,7 @@ export default function JarvisPage() {
         body: JSON.stringify({
           messages: nextMessages.map(({ role, content }) => ({ role, content })),
           context,
+          addressTerm: addressTermRef.current,
         }),
       });
       const data = await res.json();
@@ -856,7 +966,7 @@ export default function JarvisPage() {
       await speak(reply);
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") return;
-      const errMsg = "Systems experiencing interference, sir. Please repeat your query.";
+      const errMsg = `Systems experiencing interference, ${addressTermRef.current}. Please repeat your query.`;
       setJarvisText(errMsg);
       addLog("error", errMsg);
       setAppState("speaking");
@@ -866,12 +976,38 @@ export default function JarvisPage() {
     }
   }, [speak, stopTTS, addLog]);
 
+  // Handles the very first thing the user says after boot — their
+  // preferred form of address — instead of routing it to the chat API.
+  const handleAddressCapture = useCallback((text: string) => {
+    const term = extractAddressTerm(text);
+    setAddressTermState(term);
+    addressTermRef.current = term;
+    setAwaitingAddress(false);
+    addLog("status", `Will address you as "${term}" from now on.`);
+
+    const greeting = `Understood, ${term}. Systems online. How can I assist you today, ${term}?`;
+    setJarvisText(greeting);
+    setMessages([]);
+    setAppState("speaking");
+    speak(greeting).finally(() => setAppState("ready"));
+  }, [speak, addLog, setAwaitingAddress]);
+
+  // Single entry point for anything recognized speech (or typed fallback)
+  // produces — routes to address-capture on first boot, chat otherwise.
+  const handleSTTResult = useCallback((text: string) => {
+    if (awaitingAddressRef.current) {
+      handleAddressCapture(text);
+    } else {
+      handleVoiceInput(text);
+    }
+  }, [handleAddressCapture, handleVoiceInput]);
+
   const handleInterim = useCallback((text: string) => {
     setInterimText(text);
   }, []);
 
   const { start: startSTT, stop: stopSTT, isListening, supported: sttSupported } = useSTT(
-    handleVoiceInput,
+    handleSTTResult,
     handleInterim,
     addLog
   );
@@ -888,7 +1024,14 @@ export default function JarvisPage() {
   useEffect(() => {
     if (allGranted && appState === "permissions") {
       setAppState("ready");
-      setTimeout(() => speak(jarvisText), 800);
+      setAwaitingAddress(true);
+      const intro = "Systems online. Before we proceed — how should I address you, sir?";
+      setJarvisText(intro);
+      setTimeout(async () => {
+        setAppState("speaking");
+        await speak(intro);
+        setAppState("ready");
+      }, 800);
     }
   }, [allGranted]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -945,7 +1088,6 @@ export default function JarvisPage() {
 
   const activateOrb = useCallback(() => {
     if (!allGranted) return;
-    // Thinking state: orb is NOT clickable
     if (appState === "thinking") return;
     if (appState === "listening") {
       stopSTT();
@@ -977,8 +1119,8 @@ export default function JarvisPage() {
     if (!t) return;
     setTextInput("");
     setTextFallbackOpen(false);
-    handleVoiceInput(t);
-  }, [textInput, handleVoiceInput]);
+    handleSTTResult(t);
+  }, [textInput, handleSTTResult]);
 
   if (appState === "permissions") {
     return <PermissionsScreen locStatus={locStatus} micStatus={micStatus} camStatus={camStatus} onRequest={requestAll} />;
@@ -990,7 +1132,6 @@ export default function JarvisPage() {
     appState === "speaking" ? "0,212,255" : "0,180,220";
   const isActive = appState === "speaking" || appState === "listening";
 
-  // Panels visible only during listening and speaking
   const showPanels = false;
 
   return (
@@ -1067,7 +1208,6 @@ export default function JarvisPage() {
           </>
         )}
 
-        {/* Thinking pulse rings */}
         {appState === "thinking" && (
           <>
             <div className="absolute rounded-full" style={{ width: "76%", height: "76%", border: `1px solid rgba(${stateColor},0.2)`, animationName: "jPing", animationDuration: "1.6s", animationTimingFunction: "ease-out", animationIterationCount: "infinite" }} />
@@ -1079,7 +1219,6 @@ export default function JarvisPage() {
         <button
           type="button"
           onClick={handleClick}
-          // Disabled AND non-interactive during thinking
           disabled={appState === "thinking"}
           aria-label={
             appState === "listening" ? "Stop listening and send" :
@@ -1107,7 +1246,6 @@ export default function JarvisPage() {
               ? `0 0 60px rgba(${stateColor},0.3), 0 0 20px rgba(${stateColor},0.12) inset, 0 0 90px rgba(${stateColor},0.08)`
               : `0 0 18px rgba(${stateColor},0.08)`,
             cursor: appState === "thinking" ? "not-allowed" : "pointer",
-            // Slightly dim the orb during thinking to reinforce non-interactivity
             opacity: appState === "thinking" ? 0.85 : 1,
           }}
         >
@@ -1131,7 +1269,6 @@ export default function JarvisPage() {
         transition: "opacity 0.35s ease, transform 0.35s ease",
         pointerEvents: showPanels ? "auto" : "none",
       }}>
-        {/* JARVIS response */}
         <div style={{
           background: "rgba(0,0,0,0.7)",
           border: `1px solid rgba(${stateColor},0.3)`,
@@ -1146,7 +1283,6 @@ export default function JarvisPage() {
           </div>
         </div>
 
-        {/* Speech log — only during listening */}
         {appState === "listening" && (
           <div style={{
             background: "rgba(0,0,0,0.6)",
@@ -1192,7 +1328,7 @@ export default function JarvisPage() {
 
       {/* Bottom indicator */}
       <div className="absolute z-10 flex justify-center px-4" style={{ bottom: "max(0.5rem, calc(env(safe-area-inset-bottom, 0px) + 0.25rem))" }}>
-        <BottomIndicator appState={appState} color={stateColor} />
+        <BottomIndicator appState={appState} color={stateColor} addressMode={awaitingAddress} />
       </div>
 
       {textFallbackOpen && (
@@ -1202,6 +1338,7 @@ export default function JarvisPage() {
           onChange={setTextInput}
           onSubmit={submitTextFallback}
           onClose={() => setTextFallbackOpen(false)}
+          placeholder={awaitingAddress ? `e.g. "sir", "ma'am", or "call me Alex"` : `Type your query, ${addressTerm}…`}
         />
       )}
 
